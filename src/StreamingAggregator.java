@@ -148,12 +148,10 @@ public class StreamingAggregator {
         final long bMs = baseMs;
         int sensorsPerThread = (sc + nThreads - 1) / nThreads;
 
-        // Shared merged arrays — [minute][sensor] layout for cache-friendly emit
+        // Shared merged array — [minute][sensor] layout for cache-friendly emit
         TumblingState[][] mergedTumbling = new TumblingState[MAX_MINUTES][];
-        double[][][] slidingPcts = new double[MAX_MINUTES][][];
         for (int m = 0; m < MAX_MINUTES; m++) {
             mergedTumbling[m] = new TumblingState[sc];
-            slidingPcts[m] = new double[sc][];
         }
 
         @SuppressWarnings("unchecked")
@@ -162,7 +160,7 @@ public class StreamingAggregator {
             int sStart = t * sensorsPerThread;
             int sEnd = Math.min(sStart + sensorsPerThread, sc);
             mergeFutures[t] = pool.submit(() -> {
-                mergeAndComputePcts(parts, sStart, sEnd, mergedTumbling, slidingPcts);
+                mergePartitions(parts, sStart, sEnd, mergedTumbling);
             });
         }
         for (Future<?> f : mergeFutures) f.get();
@@ -189,7 +187,7 @@ public class StreamingAggregator {
         byte[][] tumblingBufs = new byte[nThreads][];
         int[] tumblingLens = new int[nThreads];
 
-        // Emit sliding windows — direct byte[] output
+        // Emit sliding windows — compute percentiles inline, direct byte[] output
         @SuppressWarnings("unchecked")
         Future<?>[] slidingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
@@ -200,19 +198,38 @@ public class StreamingAggregator {
             slidingEmitFutures[t] = pool.submit(() -> {
                 byte[] buf = new byte[8 << 20];
                 int pos = 0;
+                double[] combinedBuf = new double[1024];
                 for (int m = mStart; m < mEnd; m++) {
                     byte[] pfx = slidingPfx[m];
-                    double[][] row = slidingPcts[m];
+                    int kEnd = Math.min(m + 4, MAX_MINUTES - 1);
                     for (int s = 0; s < fsc; s++) {
-                        double[] pcts = row[s];
-                        if (pcts == null) continue;
+                        int totalSize = 0;
+                        for (int k = m; k <= kEnd; k++) {
+                            TumblingState ts = mergedTumbling[k][s];
+                            if (ts != null) totalSize += ts.size;
+                        }
+                        if (totalSize == 0) continue;
+                        if (totalSize > combinedBuf.length) combinedBuf = new double[totalSize];
+                        double[] combined = combinedBuf;
+                        int p = 0;
+                        for (int k = m; k <= kEnd; k++) {
+                            TumblingState ts = mergedTumbling[k][s];
+                            if (ts != null) {
+                                System.arraycopy(ts.values, 0, combined, p, ts.size);
+                                p += ts.size;
+                            }
+                        }
+                        int i99 = Math.max(0, (99 * totalSize + 99) / 100 - 1);
+                        int i50 = Math.max(0, (totalSize + 1) / 2 - 1);
+                        double p99 = TumblingState.quickselect(combined, 0, totalSize - 1, i99);
+                        double p50 = TumblingState.quickselect(combined, 0, i99, i50);
                         if (pos + 200 > buf.length) buf = Arrays.copyOf(buf, buf.length * 2);
                         System.arraycopy(pfx, 0, buf, pos, pfx.length); pos += pfx.length;
                         System.arraycopy(sNameBytes[s], 0, buf, pos, sNameBytes[s].length); pos += sNameBytes[s].length;
                         buf[pos++] = ',';
-                        pos = appendDoubleBytes(buf, pos, pcts[0]);
+                        pos = appendDoubleBytes(buf, pos, p50);
                         buf[pos++] = ',';
-                        pos = appendDoubleBytes(buf, pos, pcts[1]);
+                        pos = appendDoubleBytes(buf, pos, p99);
                         System.arraycopy(NEW_LINE, 0, buf, pos, NEW_LINE.length); pos += NEW_LINE.length;
                     }
                 }
@@ -278,8 +295,8 @@ public class StreamingAggregator {
         raf.close();
     }
 
-    static void mergeAndComputePcts(PartitionState[] parts, int sStart, int sEnd,
-                                     TumblingState[][] mergedTumbling, double[][][] slidingPcts) {
+    static void mergePartitions(PartitionState[] parts, int sStart, int sEnd,
+                                TumblingState[][] mergedTumbling) {
         int globalMin = MAX_MINUTES, globalMax = -1;
         for (PartitionState ps : parts) {
             if (ps.minMinute < globalMin) globalMin = ps.minMinute;
@@ -287,7 +304,6 @@ public class StreamingAggregator {
         }
         if (globalMax < 0) return;
 
-        double[] combinedBuf = new double[1024];
         for (int s = sStart; s < sEnd; s++) {
             TumblingState[] merged = new TumblingState[MAX_MINUTES];
             boolean hasData = false;
@@ -303,32 +319,8 @@ public class StreamingAggregator {
                 }
             }
             if (!hasData) continue;
-            // Write merged tumbling to [minute][sensor] layout
             for (int m = globalMin; m <= globalMax; m++) {
                 if (merged[m] != null) mergedTumbling[m][s] = merged[m];
-            }
-            // Compute sliding window percentiles from merged raw values
-            for (int m = Math.max(0, globalMin - 4); m <= Math.min(globalMax, MAX_MINUTES - 1); m++) {
-                int totalSize = 0;
-                int kEnd = Math.min(m + 4, MAX_MINUTES - 1);
-                for (int k = m; k <= kEnd; k++) {
-                    if (merged[k] != null) totalSize += merged[k].size;
-                }
-                if (totalSize == 0) continue;
-                if (totalSize > combinedBuf.length) combinedBuf = new double[totalSize];
-                double[] combined = combinedBuf;
-                int p = 0;
-                for (int k = m; k <= kEnd; k++) {
-                    if (merged[k] != null) {
-                        System.arraycopy(merged[k].values, 0, combined, p, merged[k].size);
-                        p += merged[k].size;
-                    }
-                }
-                int i99 = Math.max(0, (99 * totalSize + 99) / 100 - 1);
-                int i50 = Math.max(0, (totalSize + 1) / 2 - 1);
-                double p99 = TumblingState.quickselect(combined, 0, totalSize - 1, i99);
-                double p50 = TumblingState.quickselect(combined, 0, i99, i50);
-                slidingPcts[m][s] = new double[]{p50, p99};
             }
         }
     }
