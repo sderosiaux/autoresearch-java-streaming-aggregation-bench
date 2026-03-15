@@ -1,6 +1,6 @@
-# Streaming Aggregation: 57K to 10.7M events/sec
+# Streaming Aggregation: 57K to 11.3M events/sec
 
-A Java streaming window aggregation engine, optimized from **57,823 ev/s to 10,741,138 ev/s** (186x improvement) in **164 autonomous experiments** using [autoresearch](https://github.com/sderosiaux/claude-plugins).
+A Java streaming window aggregation engine, optimized from **57,823 ev/s to 11,261,261 ev/s** (195x improvement) in **~185 autonomous experiments** using [autoresearch](https://github.com/sderosiaux/claudecode-autoresearch).
 
 Every commit in this repo is an experiment. The commit messages document the technique, the measured throughput, and the delta from the previous best.
 
@@ -30,8 +30,8 @@ Requires Java 21+.
 Read the commit history bottom-up (`git log --oneline --reverse`) to follow the full path:
 
 ```
-57,823  → baseline: Instant.parse, String.split, ArrayList sort
-328,558 → array-indexed windows replacing HashMaps
+57,823     → baseline: Instant.parse, String.split, ArrayList sort
+328,558    → array-indexed windows replacing HashMaps
 1,857,700  → direct sensor index parsing, no HashMap
 2,683,123  → multi-threaded parallel chunk processing
 3,480,682  → parallel merge+emit by sensor range
@@ -47,25 +47,29 @@ Read the commit history bottom-up (`git log --oneline --reverse`) to follow the 
 9,980,039  → specialized double parser — dispatch by dot position
 10,493,179 → eliminate newline scan — compute line length from value format
 10,741,138 → int[] values for percentile quickselect — halve memory
+10,787,486 → all-integer TumblingState — no FP in parse hot path
+11,061,946 → digit-pair lookup tables + integer avg + direct fd output
+11,261,261 → bulk MBB copy into stack-local byte[] buffer
+11,261,261 → branchless Lomuto partition in quickselect (A/B +8%)
 ```
 
 ## Key techniques
 
 | Category | Technique | Impact |
 |----------|-----------|--------|
-| **I/O** | mmap + MappedByteBuffer.get(int) zero-copy direct parsing | +12% |
-| **Parsing** | Manual ISO-8601, precomputed day offset, specialized double parser, no newline scan | +15% |
+| **I/O** | mmap + MappedByteBuffer bulk copy into stack-local byte[] | +12% |
+| **Parsing** | Manual ISO-8601, precomputed day offset, specialized int parser, no newline scan | +15% |
 | **Data structures** | Array-indexed [minute][sensor] layout, no HashMap | +6x |
 | **Parallelism** | 12-thread chunk parse, sensor-range merge, minute-range emit | +3x |
-| **Percentiles** | Quickselect with median-of-3 pivot, inline during emit, int[] values (halved memory) | +15% |
-| **Output** | Direct byte[] assembly, zero-copy buffers | +17% |
-| **Memory** | Unified TumblingState fits one 64-byte cache line | +4% |
+| **Percentiles** | Branchless Lomuto quickselect, median-of-3 pivot, int[] values (halved memory) | +20% |
+| **Output** | Direct byte[] assembly, digit-pair lookup tables, FileOutputStream(fd) | +17% |
+| **Memory** | All-integer TumblingState (scaledSum/scaledMin/scaledMax), no FP in hot path | +6% |
 | **JVM** | C2-only compilation, AlwaysCompileLoopMethods | +5% |
 | **Emit** | Range-bounded iteration [gMin..gMax], direct merge (no temp array) | +2% |
 
 ## What didn't work
 
-~125 experiments were discarded. Patterns that consistently lost:
+~140 experiments were discarded. Patterns that consistently lost:
 - **Minute-range merge parallelism** (-10%): cache thrashing on shared mergedTumbling array
 - **Fused sliding+tumbling emit** (-13%): working set too large for L1/L2 cache
 - **Arrays.sort replacing quickselect** (-5%): full sort is O(n log n), quickselect is O(n)
@@ -83,6 +87,9 @@ Read the commit history bottom-up (`git log --oneline --reverse`) to follow the 
 - **EpsilonGC** (-12.3%): memory fragmentation without compaction degrades locality
 - **Software prefetch** (-6.4%): volatile fence + extra loop overhead, OoO engine already prefetches
 - **Panama FFI for madvise** (-7.7%): FFI init overhead + THP defrag stalls
+- **ForkJoinPool** (-11%): work-stealing queue overhead exceeds load balancing benefit
+- **p99 as O(n) max scan** (-3%): p50 loses partial ordering benefit from p99 quickselect
+- **Inline suffix byte writes** (-2%): replacing 4-byte arraycopy with individual byte writes hurts pipeline
 
 ## Architecture
 
@@ -90,11 +97,11 @@ Read the commit history bottom-up (`git log --oneline --reverse`) to follow the 
 ┌──────────────────────────────────────────────────────────┐
 │  mmap file (388MB) → 12 chunks (~32MB each)              │
 └────────┬─────────────────────────────────────────────────┘
-         │ 12 threads, MappedByteBuffer.get(int) direct access
+         │ 12 threads, bulk copy 48B lines into stack-local byte[]
          ▼
 ┌──────────────────────────────────────────────────────────┐
 │  Parse: manual ISO timestamp, hardcoded sensor_XXXX,     │
-│         specialized double parser, no newline scan        │
+│         all-integer scaled values, no newline scan        │
 │         → TumblingState[min][sensor]                      │
 └────────┬─────────────────────────────────────────────────┘
          │ 12 threads, sensor-range parallelism
@@ -105,20 +112,20 @@ Read the commit history bottom-up (`git log --oneline --reverse`) to follow the 
          │ 12 threads, minute-range parallelism
          ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Emit: sliding (inline quickselect p50/p99)              │
-│        tumbling (count/sum/min/max/avg)                  │
-│        → direct byte[] buffers, range-bounded            │
+│  Emit: sliding (branchless Lomuto quickselect p50/p99)   │
+│        tumbling (count/sum/min/max/avg as integers)      │
+│        → direct byte[] buffers, digit-pair tables        │
 └────────┬─────────────────────────────────────────────────┘
          │ sequential
          ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Output: BufferedOutputStream, 1MB buffer (~166MB total)  │
+│  Output: FileOutputStream(FileDescriptor.out), ~166MB    │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ## What is autoresearch?
 
-[autoresearch](https://github.com/sderosiaux/claude-plugins) is a Claude Code plugin that runs autonomous experiment loops. It tries ideas, benchmarks them, keeps improvements, discards regressions, and never stops. Each experiment is a git commit with the measured metric in the commit message.
+[autoresearch](https://github.com/sderosiaux/claudecode-autoresearch) is a Claude Code plugin that runs autonomous experiment loops. It tries ideas, benchmarks them, keeps improvements, discards regressions, and never stops. Each experiment is a git commit with the measured metric in the commit message.
 
 The `autoresearch.jsonl` file contains the full experiment log with metrics for every attempt (kept and discarded). The `autoresearch.md` file is the session document with profiling notes, landscape model, and tabu list.
 
@@ -126,7 +133,7 @@ The `autoresearch.jsonl` file contains the full experiment log with metrics for 
 
 | File | Purpose |
 |------|---------|
-| `src/StreamingAggregator.java` | The optimized engine (~477 lines) |
+| `src/StreamingAggregator.java` | The optimized engine (~518 lines) |
 | `src/DataGenerator.java` | Generates deterministic test data |
 | `src/BatchValidator.java` | Correctness oracle (naive but correct) |
 | `jvm.opts` | JVM flags (C2-only, loop compilation) |
