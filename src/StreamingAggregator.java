@@ -357,19 +357,12 @@ public class StreamingAggregator {
 
         int pos = chunkStart;
         while (pos < chunkEnd) {
-            int lineStart = pos;
-            pos += 31;
-            while (pos < chunkEnd && mbb.get(pos) != '\n') pos++;
-            int lineEnd = pos;
-            pos++;
+            // Fixed layout: 20-char timestamp + comma + 11-char sensor + comma + value + newline
+            // No newline scan needed — compute next position from value format
+            int c1 = pos + 20;
 
-            if (lineEnd - lineStart < 22) continue;
-
-            int c1 = lineStart + 20;
-            int c2 = c1 + 12;
-
-            int hour = (mbb.get(lineStart + 11) - '0') * 10 + (mbb.get(lineStart + 12) - '0');
-            int minute = (mbb.get(lineStart + 14) - '0') * 10 + (mbb.get(lineStart + 15) - '0');
+            int hour = (mbb.get(pos + 11) - '0') * 10 + (mbb.get(pos + 12) - '0');
+            int minute = (mbb.get(pos + 14) - '0') * 10 + (mbb.get(pos + 15) - '0');
 
             int sIdx = (mbb.get(c1 + 8) - '0') * 1000 + (mbb.get(c1 + 9) - '0') * 100
                      + (mbb.get(c1 + 10) - '0') * 10 + (mbb.get(c1 + 11) - '0');
@@ -380,19 +373,29 @@ public class StreamingAggregator {
                 if (sIdx >= ps.sensorCount) ps.sensorCount = sIdx + 1;
             }
 
-            // Inline double parsing from MappedByteBuffer
-            int di = c2 + 1;
-            boolean neg = false;
-            byte db = mbb.get(di);
-            if (db == '-') { neg = true; di++; db = mbb.get(di); }
-            long intPart = 0;
-            while (db != '.' && di < lineEnd) { intPart = intPart * 10 + (db - '0'); di++; if (di < lineEnd) db = mbb.get(di); }
-            double value = intPart;
-            if (di < lineEnd && db == '.') {
-                di++;
-                long frac = 0; double div = 1;
-                while (di < lineEnd) { frac = frac * 10 + (mbb.get(di) - '0'); div *= 10; di++; }
-                value += frac / div;
+            // Specialized double parser: values always have exactly 2 decimal places
+            // Format: [-]d{1,3}.dd — compute exact value length to skip newline scan
+            int di = pos + 33; // c1 + 12 + 1 = pos + 20 + 12 + 1
+            byte b0 = mbb.get(di);
+            boolean neg = (b0 == '-');
+            if (neg) { di++; b0 = mbb.get(di); }
+            byte b1 = mbb.get(di + 1);
+            double value;
+            if (b1 == '.') {
+                // d.dd (4 chars)
+                value = (b0 - '0') + ((mbb.get(di + 2) - '0') * 10 + (mbb.get(di + 3) - '0')) * 0.01;
+                pos = di + 5; // past d.dd + newline
+            } else {
+                byte b2 = mbb.get(di + 2);
+                if (b2 == '.') {
+                    // dd.dd (5 chars, most common: 86%)
+                    value = ((b0 - '0') * 10 + (b1 - '0')) + ((mbb.get(di + 3) - '0') * 10 + (mbb.get(di + 4) - '0')) * 0.01;
+                    pos = di + 6; // past dd.dd + newline
+                } else {
+                    // ddd.dd (6 chars)
+                    value = ((b0 - '0') * 100 + (b1 - '0') * 10 + (b2 - '0')) + ((mbb.get(di + 4) - '0') * 10 + (mbb.get(di + 5) - '0')) * 0.01;
+                    pos = di + 7; // past ddd.dd + newline
+                }
             }
             if (neg) value = -value;
 

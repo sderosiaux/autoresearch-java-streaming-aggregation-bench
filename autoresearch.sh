@@ -21,8 +21,13 @@ fi
 
 ROWS=$(wc -l < "$DATA" | tr -d ' ')
 
+JVM_OPTS=""
+if [[ -f "$SCRIPT_DIR/jvm.opts" ]]; then
+    JVM_OPTS=$(cat "$SCRIPT_DIR/jvm.opts" | tr '\n' ' ')
+fi
+
 START_NS=$(date +%s%N)
-java -cp "$OUT_DIR" StreamingAggregator "$DATA" > /tmp/autoresearch-streaming-output.txt
+java $JVM_OPTS -cp "$OUT_DIR" StreamingAggregator "$DATA" > /tmp/autoresearch-streaming-output.txt
 END_NS=$(date +%s%N)
 
 ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))

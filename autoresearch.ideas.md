@@ -1,25 +1,35 @@
 # Deferred Ideas
 
-## High Priority (based on profiling — quickselect 20%, sliding emit 19%, processChunk 13%)
-- Hardcode c2 = c1 + 12 — all sensors are "sensor_XXXX" (11 chars), eliminates 3 failed branch checks per event
-- Hardcode sensor index parse to exactly 4 digits — eliminate loop overhead
-- SWAR (8-byte batch reads via UNSAFE.getLong) for timestamp/sensor parsing
-- Skip sensor name copy for already-seen sensors — use per-partition boolean[] seen array
-- Pipeline: overlap output write with sliding emit computation (start writing tumbling while sliding still running)
-- Pre-allocate TumblingState pool to reduce GC (2.7% profile)
-- Reduce merge temp array from MAX_MINUTES to [globalMin..globalMax] range
+## High Priority (processChunkMBB 16.7%, quickselect 16.9%, sliding emit 16.3%)
+- Batch MBB reads: read 64-128 bytes per line into local byte[] via mbb.get(pos, buf, 0, len), parse from local buffer — reduces ~20 MBB.get(int) calls to 1 bulk call per line
+- Skip sensor name String allocation for already-seen sensors — use boolean[] seen array
+- Pipeline: overlap output write with sliding emit (start writing tumbling while sliding still running)
+- Pre-allocate TumblingState pool to reduce GC (4.2% profile)
 - Introselect: hybrid quickselect+median-of-medians for guaranteed O(n) worst case
+- Incremental sliding window: when advancing m→m+1, remove minute m values and add minute m+5 (avoid full copy+quickselect)
 
 ## Medium Priority
-- Avoid values[] dynamic resizing in add() — pre-size to expected ~7 values/minute/sensor
-- Read-ahead hint for mmap (madvise via Unsafe — MADV_SEQUENTIAL)
-- Use long-based encoding for sensor names instead of String (avoid String allocation)
+- Float instead of double for values[] — halve memory, better cache utilization (verify precision)
 - Eliminate `new TumblingState[MAX_SENSORS]` per-minute allocation in processChunk — lazy sparse structure
-- Float instead of double for values[] — halve memory, better cache utilization (but verify precision)
-- Two-pass quickselect optimization: find p99 first, then p50 within [0..i99] (already doing this)
+- GraalVM native-image — AOT compilation eliminates JIT warmup, potentially faster steady state
+- Reduce output size: smaller number formatting (fewer decimal places if checks allow)
+- Use long-based encoding for sensor names instead of String (avoid String allocation)
 
 ## Lower Priority
-- JVM flags: -XX:+UseParallelGC, -XX:+AlwaysPreTouch (currently using G1GC defaults)
 - NUMA-aware chunk assignment
 - Custom percentile algorithm: selection networks for small N
-- Vector API (Java 21 preview) for batch numeric operations
+- Vector API (Java 21+ preview) for batch numeric operations
+- Reduce merge contention with lock-free CAS on TumblingState slots
+
+## Tried and Failed (do not retry)
+- Arrays.sort replacing quickselect (-5%)
+- Insertion sort for small N (-3%)
+- ParallelGC (-15%), AlwaysPreTouch (no effect)
+- MemorySegment API (bimodal JIT, 6.2-10.2M)
+- Byte[] copy from mmap (-10% vs zero-copy)
+- pread-based parallel reading (-12%)
+- SWAR newline scan on MBB (negligible, ~7 bytes to scan after skip-31)
+- Fused sliding+tumbling emit (-13%)
+- Minute-range merge parallelism (-10%)
+- Pre-sort values during merge (-25%)
+- Fused merge+sliding (-19%)

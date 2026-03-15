@@ -8,9 +8,10 @@ Maximize throughput (events/sec) of `StreamingAggregator.java`. 10M timestamped 
 
 ## Files in Scope
 - `src/StreamingAggregator.java` (must `git add -f` to commit)
+- `jvm.opts` — JVM flags read by autoresearch.sh/checks.sh (one flag per line)
 
 ## Off Limits
-- DataGenerator.java, BatchValidator.java, autoresearch.sh, autoresearch.checks.sh
+- DataGenerator.java, BatchValidator.java
 
 ## Constraints
 - `./autoresearch.checks.sh` must pass
@@ -21,18 +22,17 @@ Maximize throughput (events/sec) of `StreamingAggregator.java`. 10M timestamped 
 Log results with `${CLAUDE_PLUGIN_ROOT}/scripts/log-experiment.sh`.
 
 ## Profiling Notes
-### Profile at 9.15M ev/s (experiment 108, async-profiler):
+### Profile at 9.3M ev/s (MBB zero-copy version, async-profiler):
 ```
-quickselect:        20.3% (137 samples)
-sliding emit:       18.8% (134 samples) — includes percentile computation
-processChunk:       13.3% (94 samples)
-tumbling emit:      10.2% (68 samples)
-mergePartitions:     8.4% (58 samples)
-GC:                  2.7% (17 samples)
-parseDoubleUnsafe:   2.4% (17 samples)
-TumblingState.add:   2.1% (15 samples)
-arraycopy:           1.4% (10 samples)
-avg():               1.4% (10 samples)
+quickselect:        16.9%
+sliding emit:       16.3% (lambda$main$2, sans quickselect)
+processChunkMBB:    16.7% (MBB.get() overhead vs byte[] access)
+tumbling emit:       8.8% (lambda$main$3)
+mergePartitions:     7.1%
+GC:                  4.2%
+TumblingState.add:   2.3%
+appendLongBytes:     2.6%
+DirectByteBuffer.get: 1.5%
 ```
 
 ### Data characteristics:
@@ -41,16 +41,16 @@ avg():               1.4% (10 samples)
 - All sensors: c2 is ALWAYS c1 + 12 (sensor name always 11 chars)
 - Sliding windows average ~30 values (5 min x ~6 ev/min)
 - Output size: ~166MB, File size: ~388MB
-- 12 mmap'd chunks (~32MB each), parsed directly via Unsafe
+- 12 mmap'd chunks (~32MB each), parsed via MappedByteBuffer.get(int) — zero copy, no Unsafe
 
 ## Landscape Model
-Current: 9.15M ev/s (158x baseline). Architecture: parallel mmap+Unsafe parse -> parallel sensor-range merge -> parallel emit (sliding+tumbling separate) -> sequential output.
+Current: 9.3M ev/s (162x baseline). Architecture: mmap + MappedByteBuffer.get(int) zero-copy parse -> parallel sensor-range merge -> parallel minute-range emit (sliding+tumbling separate) -> sequential output.
 
-**Exhausted dimensions**: parsing micro-opts (JIT handles), emit strategy, sort elimination, merge parallelism model (sensor-range wins over minute-range), output method/buffer sizes, chunk count, fused emit (too large working set), median-of-3 pivot (optimal), values[] initial sizing.
+**Exhausted dimensions**: parsing micro-opts (JIT handles), emit strategy, sort elimination, merge parallelism model (sensor-range wins over minute-range), output method/buffer sizes, chunk count, fused emit (too large working set), median-of-3 pivot (optimal), values[] initial sizing, byte[] copy approaches (mmap→byte[] +copy overhead, pread even worse), MemorySegment (bimodal JIT), Arrays.sort (worse than quickselect), insertion sort (branch misprediction), JVM flags (ParallelGC worse, AlwaysPreTouch no help).
 
-**Hot path**: quickselect (20%) + sliding emit (19%) = 39% of runtime. processChunk (13%) is third.
+**Hot path**: processChunkMBB (16.7%) + quickselect (16.9%) + sliding emit (16.3%) = 50% of runtime.
 
-**Gradient points toward**: reducing per-event branch count in parse, reducing quickselect calls, reducing merge overhead, pipelining output with compute.
+**Gradient points toward**: reducing MBB.get() call count (batch reads), reducing quickselect work, reducing merge overhead, pipelining output with compute.
 
 ## What's Been Tried (108 experiments, ~22 kept)
 
