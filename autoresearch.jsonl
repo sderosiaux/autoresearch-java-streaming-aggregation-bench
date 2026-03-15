@@ -58,3 +58,6 @@
 {"commit":"17deadc","metric":4887585,"status":"discard","description":"SlidingState initial array 64→8: resize overhead > memory savings (-5.2%)","metrics":{},"timestamp":1773554453}
 {"commit":"17deadc","metric":4899559,"status":"discard","description":"SlidingState initial array 64→16: still regresses (-5%), high GC variance","metrics":{},"timestamp":1773554481}
 {"commit":"17deadc","metric":5293806,"status":"keep","description":"lazy sliding windows: 1 raw write per event instead of 5, combine at merge time (+2.6%)","metrics":{},"timestamp":1773554715}
+{"commit":"2d8ae0a","metric":5243838,"status":"discard","description":"SoA tumbling (primitive arrays): Arrays.fill init overhead, no improvement","metrics":{},"timestamp":1773555256}
+{"commit":"2d8ae0a","metric":5302226,"status":"discard","description":"direct minute-index + merged if: within noise, JIT already optimizes","metrics":{},"timestamp":1773555386}
+{"commit":"2d8ae0a","metric":5743825,"status":"keep","description":"direct byte[] emit: eliminate StringBuilder→String→byte[] triple copy (+8.5%)","metrics":{},"timestamp":1773555636}

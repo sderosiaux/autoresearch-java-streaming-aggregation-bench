@@ -181,18 +181,23 @@ public class StreamingAggregator {
         }
         for (Future<?> f : mergeFutures) f.get();
 
-        // Pre-compute prefixes: "sliding,{ts}," and "tumbling,{ts},"
-        String[] slidingPfx = new String[MAX_MINUTES];
-        String[] tumblingPfx = new String[MAX_MINUTES];
+        // Pre-compute prefixes as byte[] and sensor names as byte[]
+        byte[][] slidingPfx = new byte[MAX_MINUTES][];
+        byte[][] tumblingPfx = new byte[MAX_MINUTES][];
         for (int m = 0; m < MAX_MINUTES; m++) {
             long ws = bMs + (long) m * 60_000;
-            slidingPfx[m] = "sliding," + ws + ",";
-            tumblingPfx[m] = "tumbling," + ws + ",";
+            slidingPfx[m] = ("sliding," + ws + ",").getBytes();
+            tumblingPfx[m] = ("tumbling," + ws + ",").getBytes();
         }
+        byte[][] sNameBytes = new byte[sc][];
+        for (int s = 0; s < sc; s++) {
+            sNameBytes[s] = sNames[s] != null ? sNames[s].getBytes() : new byte[0];
+        }
+        byte[] NEW_LINE = ",new\n".getBytes();
 
         int minutesPerThread = (MAX_MINUTES + nThreads - 1) / nThreads;
 
-        // Emit sliding windows — direct append, pre-computed prefixes
+        // Emit sliding windows — direct byte[] output
         @SuppressWarnings("unchecked")
         Future<byte[]>[] slidingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
@@ -200,22 +205,28 @@ public class StreamingAggregator {
             int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
             final int fsc = sc;
             slidingEmitFutures[t] = pool.submit(() -> {
-                StringBuilder out = new StringBuilder(500_000 * 80 / nThreads);
+                byte[] buf = new byte[500_000 * 80 / nThreads];
+                int pos = 0;
                 for (int m = mStart; m < mEnd; m++) {
-                    String pfx = slidingPfx[m];
+                    byte[] pfx = slidingPfx[m];
                     for (int s = 0; s < fsc; s++) {
                         if (slidingPcts[s] == null || slidingPcts[s][m] == null) continue;
                         double[] pcts = slidingPcts[s][m];
-                        out.append(pfx).append(sNames[s]).append(',');
-                        appendDouble(out, pcts[0]); out.append(',');
-                        appendDouble(out, pcts[1]); out.append(",new\n");
+                        if (pos + 200 > buf.length) buf = Arrays.copyOf(buf, buf.length * 2);
+                        System.arraycopy(pfx, 0, buf, pos, pfx.length); pos += pfx.length;
+                        System.arraycopy(sNameBytes[s], 0, buf, pos, sNameBytes[s].length); pos += sNameBytes[s].length;
+                        buf[pos++] = ',';
+                        pos = appendDoubleBytes(buf, pos, pcts[0]);
+                        buf[pos++] = ',';
+                        pos = appendDoubleBytes(buf, pos, pcts[1]);
+                        System.arraycopy(NEW_LINE, 0, buf, pos, NEW_LINE.length); pos += NEW_LINE.length;
                     }
                 }
-                return out.toString().getBytes();
+                return Arrays.copyOf(buf, pos);
             });
         }
 
-        // Emit tumbling windows — direct append, pre-computed prefixes
+        // Emit tumbling windows — direct byte[] output
         @SuppressWarnings("unchecked")
         Future<byte[]>[] tumblingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
@@ -223,20 +234,30 @@ public class StreamingAggregator {
             int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
             final int fsc = sc;
             tumblingEmitFutures[t] = pool.submit(() -> {
-                StringBuilder out = new StringBuilder(500_000 * 80 / nThreads);
+                byte[] buf = new byte[500_000 * 80 / nThreads];
+                int pos = 0;
                 for (int m = mStart; m < mEnd; m++) {
-                    String pfx = tumblingPfx[m];
+                    byte[] pfx = tumblingPfx[m];
                     for (int s = 0; s < fsc; s++) {
                         if (mergedTumbling[s] == null || mergedTumbling[s][m] == null) continue;
                         TumblingState state = mergedTumbling[s][m];
-                        out.append(pfx).append(sNames[s]).append(',').append(state.count).append(',');
-                        appendDouble(out, state.sum); out.append(',');
-                        appendDouble(out, state.min); out.append(',');
-                        appendDouble(out, state.max); out.append(',');
-                        appendDouble(out, state.avg()); out.append(",new\n");
+                        if (pos + 200 > buf.length) buf = Arrays.copyOf(buf, buf.length * 2);
+                        System.arraycopy(pfx, 0, buf, pos, pfx.length); pos += pfx.length;
+                        System.arraycopy(sNameBytes[s], 0, buf, pos, sNameBytes[s].length); pos += sNameBytes[s].length;
+                        buf[pos++] = ',';
+                        pos = appendLongBytes(buf, pos, state.count);
+                        buf[pos++] = ',';
+                        pos = appendDoubleBytes(buf, pos, state.sum);
+                        buf[pos++] = ',';
+                        pos = appendDoubleBytes(buf, pos, state.min);
+                        buf[pos++] = ',';
+                        pos = appendDoubleBytes(buf, pos, state.max);
+                        buf[pos++] = ',';
+                        pos = appendDoubleBytes(buf, pos, state.avg());
+                        System.arraycopy(NEW_LINE, 0, buf, pos, NEW_LINE.length); pos += NEW_LINE.length;
                     }
                 }
-                return out.toString().getBytes();
+                return Arrays.copyOf(buf, pos);
             });
         }
 
@@ -426,13 +447,27 @@ public class StreamingAggregator {
         return neg ? -result : result;
     }
 
-    private static void appendDouble(StringBuilder sb, double d) {
-        if (d < 0) { sb.append('-'); d = -d; }
+    private static int appendDoubleBytes(byte[] buf, int pos, double d) {
+        if (d < 0) { buf[pos++] = '-'; d = -d; }
         long scaled = Math.round(d * 100);
         long intPart = scaled / 100;
         int fracPart = (int)(scaled % 100);
-        sb.append(intPart).append('.');
-        if (fracPart < 10) sb.append('0');
-        sb.append(fracPart);
+        pos = appendLongBytes(buf, pos, intPart);
+        buf[pos++] = '.';
+        buf[pos++] = (byte)('0' + fracPart / 10);
+        buf[pos++] = (byte)('0' + fracPart % 10);
+        return pos;
+    }
+
+    private static int appendLongBytes(byte[] buf, int pos, long v) {
+        if (v < 0) { buf[pos++] = '-'; v = -v; }
+        if (v == 0) { buf[pos++] = '0'; return pos; }
+        int start = pos;
+        while (v > 0) { buf[pos++] = (byte)('0' + (int)(v % 10)); v /= 10; }
+        // Reverse digits
+        for (int i = start, j = pos - 1; i < j; i++, j--) {
+            byte t = buf[i]; buf[i] = buf[j]; buf[j] = t;
+        }
+        return pos;
     }
 }
