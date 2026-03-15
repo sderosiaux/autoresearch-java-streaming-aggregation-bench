@@ -1,35 +1,124 @@
 # Deferred Ideas
 
-## High Priority (processChunkMBB 16.7%, quickselect 16.9%, sliding emit 16.3%)
-- Batch MBB reads: read 64-128 bytes per line into local byte[] via mbb.get(pos, buf, 0, len), parse from local buffer — reduces ~20 MBB.get(int) calls to 1 bulk call per line
+## High Priority (sliding emit 20.8%, quickselect 18.8%, parse 10.2%)
 - Skip sensor name String allocation for already-seen sensors — use boolean[] seen array
-- Pipeline: overlap output write with sliding emit (start writing tumbling while sliding still running)
-- Pre-allocate TumblingState pool to reduce GC (4.2% profile)
 - Introselect: hybrid quickselect+median-of-medians for guaranteed O(n) worst case
 - Incremental sliding window: when advancing m→m+1, remove minute m values and add minute m+5 (avoid full copy+quickselect)
+- 4KB block buffer for parse: read 4KB from MBB instead of 48 bytes/line, reduce per-line bounds-check overhead (~3.4% of CPU)
+- Counting sort for percentiles if value range is bounded (histogram in L1-sized bucket array)
 
 ## Medium Priority
-- Float instead of double for values[] — halve memory, better cache utilization (verify precision)
-- Eliminate `new TumblingState[MAX_SENSORS]` per-minute allocation in processChunk — lazy sparse structure
-- GraalVM native-image — AOT compilation eliminates JIT warmup, potentially faster steady state
-- Reduce output size: smaller number formatting (fewer decimal places if checks allow)
 - Use long-based encoding for sensor names instead of String (avoid String allocation)
+- NIO FileChannel for output (scatter-gather writev)
+- Reduce [no_Java_frame] overhead (19.9%): JIT warmup, GC, page faults
 
 ## Lower Priority
 - NUMA-aware chunk assignment
 - Custom percentile algorithm: selection networks for small N
-- Vector API (Java 21+ preview) for batch numeric operations
+- Vector API (Java 21+ incubator) for batch numeric operations
 - Reduce merge contention with lock-free CAS on TumblingState slots
 
+## Tried and Kept (do not retry — already applied)
+- Batch MBB reads: bulk copy 48 bytes into stack-local byte[] (+1.8%, A/B +5.5%)
+- int[] values for percentile quickselect — halve memory (+2.4%)
+- All-integer TumblingState — scaledSum/scaledMin/scaledMax, no FP in hot path (+0.4%, A/B +7%)
+- Digit-pair lookup tables + integer avg + direct FileOutputStream(fd) output (+2.5%, A/B)
+- Branchless Lomuto partition in quickselect — eliminate branch mispredictions (A/B +8%)
+- Specialized double parser — dispatch by dot position (+2.0%)
+- Eliminate newline scan — compute line length from value format (+5.1%)
+- C2-only JIT + AlwaysCompileLoopMethods (+4.7%)
+- mmap file reading + single file-wide mmap shared across threads (+5.3%)
+- MappedByteBuffer zero-copy parsing (no Unsafe) — MBB bounds checks cheaper than Unsafe scope management
+- Inline sliding percentiles during emit — eliminate intermediate allocation (+3.5%)
+- Integer percentile indices + zero-copy emit buffers (+8.4%)
+- Merge SlidingState into TumblingState — unified state, one cache line (+4.2%)
+- Direct byte[] emit — eliminate StringBuilder→String→byte[] triple copy (+8.5%)
+- Parallel byte[] conversion in emit threads (+9.4%)
+- Multi-threaded parallel chunk processing with byte[] parsing
+- Array-indexed [minute][sensor] layout replacing HashMaps
+- Direct sensor index from digits, eliminates HashMap lookup
+
 ## Tried and Failed (do not retry)
-- Arrays.sort replacing quickselect (-5%)
-- Insertion sort for small N (-3%)
-- ParallelGC (-15%), AlwaysPreTouch (no effect)
-- MemorySegment API (bimodal JIT, 6.2-10.2M)
-- Byte[] copy from mmap (-10% vs zero-copy)
-- pread-based parallel reading (-12%)
-- SWAR newline scan on MBB (negligible, ~7 bytes to scan after skip-31)
-- Fused sliding+tumbling emit (-13%)
-- Minute-range merge parallelism (-10%)
-- Pre-sort values during merge (-25%)
-- Fused merge+sliding (-19%)
+
+### Quickselect / Percentiles
+- Arrays.sort replacing quickselect (-5% to -14%): full sort O(n log n) > quickselect O(n)
+- Insertion sort for small sliding windows N≤32 (-3% to -19%): O(N²) branch-heavy
+- Pre-sort values during merge (-25%): O(n log n) sort overhead per minute far exceeds savings
+- Sorted SlidingState with O(n+m) merge (no improvement over quickselect)
+- Pre-sorted sliding + merge-sort merge (-13%): sort+alloc overhead exceeds quickselect savings
+- p99 as O(n) max scan (-3% to -6%): p50 loses partial ordering benefit from p99 quickselect
+- Reverse percentile order p50 first (neutral): range narrowing offset by lost partial ordering
+- Remove median-of-3 pivot (-3.3%): worse pivot quality increases iteration count
+- Selection networks for small N — not tried yet but insertion sort variants all failed
+
+### Memory / Data Structures
+- Adding fields to TumblingState (-5%): pushes object past 64-byte cache line boundary
+- TumblingState object size reduction 56→40 bytes (neutral): hot path on int[] arrays, not fields
+- Object compaction (-14.5%): 864K TumblingState allocations + GC outweigh cache gains
+- Smaller initial values array [4] (-8%): resize copies offset allocation savings
+- SlidingState initial array 64→16/8 (-5%): high GC variance from resizes
+- double[8] sliding arrays + in-place percentiles (-10%): too many resizes
+- Flat slidingP50/P99 arrays with NaN sentinel (-5%): Arrays.fill + isNaN overhead
+- Reuse per-sensor temp arrays with Arrays.fill (-7%): fill slower than TLAB alloc
+- Pre-allocate sensor rows + hoist sRow (no improvement, memory waste)
+- SoA tumbling (primitive arrays): Arrays.fill init overhead
+- MAX_SENSORS=1000 exact count (-0.7%): 800 bytes smaller per row, no measurable cache benefit
+
+### Parallelism / Threading
+- Minute-range merge parallelism (-10%): cache thrashing on shared mergedTumbling array
+- ForkJoinPool replacing FixedThreadPool (-11%): work-stealing overhead exceeds load balancing
+- ForkJoinPool.commonPool() (neutral): nCPU-1 threads offset startup savings
+- Virtual threads (-4%): scheduling overhead for CPU-bound work
+- 6 emit threads instead of 12 (-11%): emit is CPU-bound, less parallelism hurts
+- 6 parse threads (-9%): insufficient parallelism
+- nThreads/2 chunks (no improvement): reduced parse parallelism
+- Two-phase merge minute-parallel raw + sensor-parallel pcts (-8%): barrier overhead
+- Single-partition processing (-38%): sequential parsing bottleneck
+
+### Emit / Output
+- Fused sliding+tumbling emit (-13%): working set too large for L1/L2 cache
+- Combined sliding+tumbling emit per task (-7%): larger working set hurts cache
+- Sensor-major emit ordering (-6.4%): cross-core sharing on mergedTumbling row arrays
+- Sliding emit loop reorder sensor-outer, minute-inner (-2%): row spatial locality regression
+- Write tumbling output first (-4.5%): output I/O evicts cache lines sliding still reads
+- Inline suffix + sensor name with comma (regression 3+/5-): replacing small arraycopy with byte writes
+- Inline newline suffix as direct byte writes (neutral): arraycopy overhead for 5 bytes negligible
+- Concat emit chunks before writing (-14%): 166MB extra allocation GC pressure
+- 8MB BufferedOutputStream (-5%): cache pressure
+- 4MB output buffer (-5%): larger buffer evicts cache
+- Bypass System.out with FileDescriptor.out (-8%): pipe buffer contention
+- FileChannel output (no improvement)
+- Sensor-range sliding with contiguous value tape (-3%): tape building overhead offsets locality
+
+### I/O / Parsing
+- MemorySegment API (-18%): segment validity + scope checks more overhead than MBB bounds checks
+- Batch getLong/getInt reads (-2.5%): C2 already eliminates bounds checks, shift/mask ALU hurts
+- Byte[] copy from mmap (-10%): 384MB heap allocation + copyMemory0 + GC overhead
+- pread-based parallel reading (-12%): per-chunk syscalls slower than single mmap
+- Single bulk read + parallel parse (-23%): 388MB allocation GC pressure
+- Hybrid bulk prefix read (-2%): mbb.get(pos,buf,0,33) bulk overhead offsets savings
+- Per-line bulk read into local byte[48] (-1.5%): earlier version, less effective than current 48B approach
+- SWAR newline scan on MBB (negligible): only ~7 bytes to scan after skip-31
+- Memory-mapped I/O with byte-level parsing (no improvement vs BufferedReader)
+- Independent file handles per thread (no improvement)
+
+### JVM Tuning
+- Aggressive JIT inlining MaxInlineLevel/InlineSmallCode/FreqInlineSize (-1.6%): code bloat hurts icache
+- LoopUnrollLimit=120 (noise): no measurable effect
+- ParallelGC (-15%): more stop-the-world pauses than G1GC
+- EpsilonGC (-12.3%): memory fragmentation without compaction degrades locality
+- ZGC (slower): ZGC overhead for this workload
+- GraalVM CE/Oracle 21 (-20-30%): Graal JIT doesn't optimize MBB.get() as well as HotSpot C2
+- AlwaysPreTouch (no effect)
+
+### Miscellaneous
+- Explicit min/max branches (-6.5%): Math.min/max compiles to branchless FCMOV/MAXSD on x86-64
+- Software prefetch (-6.4%): volatile fence + extra loop overhead, OoO engine already prefetches
+- Panama FFI for madvise (-7.7%): FFI init overhead + THP defrag stalls
+- 32-bit division for minute index (-5%): JIT already uses multiply-by-reciprocal
+- Fused merge+sliding (-19%): sliding reads ALL minutes per sensor, poor cache locality
+- Direct merge into output layout (-5%): worse cache locality from (partition,minute,sensor) loop order
+- Pre-compute avg + inline newline + reuse merged[] (-5%): clearing loop overhead
+- Cumulative size table for fast sliding window skip (-3%): 6MB array adds cache pressure
+- Unroll 5-minute sliding k-loop (noise): JIT already optimizes the loop
+- Hardcode c2=c1+12 + unrolled 4-digit sensor index (noise): JIT already predicts the pattern
