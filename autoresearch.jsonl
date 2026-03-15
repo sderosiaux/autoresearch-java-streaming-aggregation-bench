@@ -90,3 +90,4 @@
 {"commit":"b5678ac","metric":7107320,"status":"discard","description":"experiment: combined sliding+tumbling emit per task — larger working set hurts cache (7107320 ev/s, -7.3%)","metrics":{},"timestamp":1773585884}
 {"commit":"b5678ac","metric":7299270,"status":"discard","description":"experiment: flat slidingP50/P99 arrays with NaN sentinel — Arrays.fill(NaN) + isNaN overhead outweighs savings (7299270 ev/s, -4.8%)","metrics":{},"timestamp":1773585956}
 {"commit":"b5678ac","metric":6756756,"status":"discard","description":"experiment: single mmap + shared data array — 388MB allocation GC pressure (6756756 ev/s, -11.9%)","metrics":{},"timestamp":1773586022}
+{"commit":"04e873d","metric":7898894,"status":"keep","description":"experiment: skip 31 bytes before newline scan — known minimum line length avoids scanning fixed-format prefix (7898894 ev/s, +3.0%)","metrics":{},"timestamp":1773586129}

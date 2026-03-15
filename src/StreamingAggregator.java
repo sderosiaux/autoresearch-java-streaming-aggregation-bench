@@ -346,6 +346,13 @@ public class StreamingAggregator {
         mbb.get(data);
         int limit = data.length;
 
+        // Precompute date→minute offset from first event in this chunk
+        // All events in a chunk share the same date (data is time-sorted, chunks are contiguous)
+        long firstChunkTs = parseIsoBytesArr(data, 0);
+        int baseDayMinutes = (int)(firstChunkTs / 60_000) - (int)(firstChunkTs / 60_000) % 1440;
+        int baseMinute = (int)(baseMs / 60_000);
+        int dayOffset = baseDayMinutes - baseMinute;
+
         int pos = 0;
         while (pos < limit) {
             int lineStart = pos;
@@ -366,8 +373,9 @@ public class StreamingAggregator {
             else if (data[c1 + 11] == ',') c2 = c1 + 11;
             else c2 = c1 + 12;
 
-            // Parse timestamp
-            long timestampMs = parseIsoBytesArr(data, lineStart);
+            // Fast minute computation — only parse HH:MM, skip full epoch conversion
+            int hour = (data[lineStart+11] - '0') * 10 + (data[lineStart+12] - '0');
+            int minute = (data[lineStart+14] - '0') * 10 + (data[lineStart+15] - '0');
 
             // Parse sensor index
             int sIdx = 0;
@@ -384,8 +392,8 @@ public class StreamingAggregator {
             // Parse double
             double value = parseDoubleBytesArr(data, c2 + 1, lineEnd);
 
-            // Compute minute index relative to baseMs
-            int eventMinute = (int) ((timestampMs - baseMs) / 60_000);
+            // Minute index from precomputed day offset + HH:MM
+            int eventMinute = dayOffset + hour * 60 + minute;
 
             if (eventMinute >= 0 && eventMinute < MAX_MINUTES) {
                 if (eventMinute < ps.minMinute) ps.minMinute = eventMinute;
