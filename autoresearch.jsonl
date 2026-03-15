@@ -101,3 +101,5 @@
 {"commit":"6e8add8","metric":7806401,"status":"discard","description":"experiment: Arrays.sort replaces quickselect — full sort O(n log n) slower than two-call quickselect with partial partition reuse (-5.3%)","metrics":{},"timestamp":1773587531}
 {"commit":"6e8add8","metric":7861635,"status":"discard","description":"experiment: pre-compute avg + inline newline + reuse merged[] — clearing loop overhead offsets micro-gains (-4.6%)","metrics":{},"timestamp":1773588034}
 {"commit":"6e8add8","metric":8244023,"status":"discard","description":"experiment: inline newline suffix as direct byte writes — arraycopy overhead for 5 bytes is negligible (+0.0%, noise)","metrics":{},"timestamp":1773588097}
+{"commit":"c003ffa","metric":8536103,"status":"keep","description":"experiment: eliminate slidingPcts — compute percentiles inline during emit (8536103 ev/s, +3.5%)","metrics":{},"timestamp":1773588265}
+{"commit":"c003ffa","metric":8517887,"status":"discard","description":"experiment: unroll 5-minute sliding k-loop — JIT already optimizes the loop, manual unrolling adds code bloat (-0.2%, noise)","metrics":{},"timestamp":1773588527}

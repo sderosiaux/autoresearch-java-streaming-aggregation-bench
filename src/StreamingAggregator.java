@@ -16,6 +16,18 @@ public class StreamingAggregator {
     static final int MAX_MINUTES = 1500;
     static final int MAX_SENSORS = 1100;
 
+    @SuppressWarnings("removal")
+    private static final sun.misc.Unsafe UNSAFE;
+    private static final long BUF_ADDR_OFFSET;
+    static {
+        try {
+            java.lang.reflect.Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            UNSAFE = (sun.misc.Unsafe) f.get(null);
+            BUF_ADDR_OFFSET = UNSAFE.objectFieldOffset(Buffer.class.getDeclaredField("address"));
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
     // Unified state: tumbling aggregates + raw values for sliding percentiles
     static class TumblingState {
         long count = 0;
@@ -332,15 +344,13 @@ public class StreamingAggregator {
         long size = end - start;
         if (size <= 0) return ps;
 
-        // Read chunk via mmap — benefits from kernel readahead
+        // mmap without heap copy — parse directly from mapped memory via Unsafe
         java.nio.MappedByteBuffer mbb = channel.map(FileChannel.MapMode.READ_ONLY, start, Math.min(size, Integer.MAX_VALUE));
-        byte[] data = new byte[(int) Math.min(size, Integer.MAX_VALUE)];
-        mbb.get(data);
-        int limit = data.length;
+        long addr = UNSAFE.getLong(mbb, BUF_ADDR_OFFSET);
+        int limit = (int) Math.min(size, Integer.MAX_VALUE);
 
         // Precompute date→minute offset from first event in this chunk
-        // All events in a chunk share the same date (data is time-sorted, chunks are contiguous)
-        long firstChunkTs = parseIsoBytesArr(data, 0);
+        long firstChunkTs = parseIsoUnsafe(addr, 0);
         int baseDayMinutes = (int)(firstChunkTs / 60_000) - (int)(firstChunkTs / 60_000) % 1440;
         int baseMinute = (int)(baseMs / 60_000);
         int dayOffset = baseDayMinutes - baseMinute;
@@ -348,43 +358,39 @@ public class StreamingAggregator {
         int pos = 0;
         while (pos < limit) {
             int lineStart = pos;
-            // Skip 31 bytes: minimum line is 32 (20 ts + 1 comma + 8 sensor_X + 1 comma + 1 digit + 1 newline)
             pos += 31;
-            while (pos < limit && data[pos] != '\n') pos++;
+            while (pos < limit && UNSAFE.getByte(addr + pos) != '\n') pos++;
             int lineEnd = pos;
-            pos++; // skip newline
+            pos++;
 
             if (lineEnd - lineStart < 22) continue;
 
-            // Fixed CSV format: YYYY-MM-DDTHH:MM:SSZ,sensor_XXXX,value
             int c1 = lineStart + 20;
-            // Second comma: sensor name is "sensor_" + 1-4 digits → c2 in [c1+9, c1+12]
             int c2;
-            if (data[c1 + 9] == ',') c2 = c1 + 9;
-            else if (data[c1 + 10] == ',') c2 = c1 + 10;
-            else if (data[c1 + 11] == ',') c2 = c1 + 11;
+            if (UNSAFE.getByte(addr + c1 + 9) == ',') c2 = c1 + 9;
+            else if (UNSAFE.getByte(addr + c1 + 10) == ',') c2 = c1 + 10;
+            else if (UNSAFE.getByte(addr + c1 + 11) == ',') c2 = c1 + 11;
             else c2 = c1 + 12;
 
-            // Fast minute computation — only parse HH:MM, skip full epoch conversion
-            int hour = (data[lineStart+11] - '0') * 10 + (data[lineStart+12] - '0');
-            int minute = (data[lineStart+14] - '0') * 10 + (data[lineStart+15] - '0');
+            int hour = (UNSAFE.getByte(addr + lineStart + 11) - '0') * 10 + (UNSAFE.getByte(addr + lineStart + 12) - '0');
+            int minute = (UNSAFE.getByte(addr + lineStart + 14) - '0') * 10 + (UNSAFE.getByte(addr + lineStart + 15) - '0');
 
-            // Parse sensor index
             int sIdx = 0;
             for (int i = c1 + 8; i < c2; i++) {
-                sIdx = sIdx * 10 + (data[i] - '0');
+                sIdx = sIdx * 10 + (UNSAFE.getByte(addr + i) - '0');
             }
             if (sIdx >= MAX_SENSORS) continue;
 
             if (ps.sensorNames[sIdx] == null) {
-                ps.sensorNames[sIdx] = new String(data, c1 + 1, c2 - c1 - 1);
+                int nameLen = c2 - c1 - 1;
+                byte[] nameBytes = new byte[nameLen];
+                for (int j = 0; j < nameLen; j++) nameBytes[j] = UNSAFE.getByte(addr + c1 + 1 + j);
+                ps.sensorNames[sIdx] = new String(nameBytes);
                 if (sIdx >= ps.sensorCount) ps.sensorCount = sIdx + 1;
             }
 
-            // Parse double
-            double value = parseDoubleBytesArr(data, c2 + 1, lineEnd);
+            double value = parseDoubleUnsafe(addr, c2 + 1, lineEnd);
 
-            // Minute index from precomputed day offset + HH:MM
             int eventMinute = dayOffset + hour * 60 + minute;
 
             if (eventMinute >= 0 && eventMinute < MAX_MINUTES) {
@@ -398,6 +404,7 @@ public class StreamingAggregator {
             }
         }
 
+        java.lang.ref.Reference.reachabilityFence(mbb);
         return ps;
     }
 
@@ -431,6 +438,36 @@ public class StreamingAggregator {
             i++;
             long frac = 0; double div = 1;
             while (i < end) { frac = frac * 10 + (b[i] - '0'); div *= 10; i++; }
+            result += frac / div;
+        }
+        return neg ? -result : result;
+    }
+
+    private static long parseIsoUnsafe(long addr, int off) {
+        int year = (UNSAFE.getByte(addr+off) - '0') * 1000 + (UNSAFE.getByte(addr+off+1) - '0') * 100 + (UNSAFE.getByte(addr+off+2) - '0') * 10 + (UNSAFE.getByte(addr+off+3) - '0');
+        int month = (UNSAFE.getByte(addr+off+5) - '0') * 10 + (UNSAFE.getByte(addr+off+6) - '0');
+        int day = (UNSAFE.getByte(addr+off+8) - '0') * 10 + (UNSAFE.getByte(addr+off+9) - '0');
+        int hour = (UNSAFE.getByte(addr+off+11) - '0') * 10 + (UNSAFE.getByte(addr+off+12) - '0');
+        int minute = (UNSAFE.getByte(addr+off+14) - '0') * 10 + (UNSAFE.getByte(addr+off+15) - '0');
+        int second = (UNSAFE.getByte(addr+off+17) - '0') * 10 + (UNSAFE.getByte(addr+off+18) - '0');
+        long totalDays = 365L * (year - 1970);
+        totalDays += countLeapYears(year - 1) - countLeapYears(1969);
+        boolean leap = (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
+        totalDays += (leap ? DAYS_CUM_LEAP : DAYS_CUM)[month - 1] + day - 1;
+        return ((totalDays * 24 + hour) * 60 + minute) * 60000L + second * 1000L;
+    }
+
+    private static double parseDoubleUnsafe(long addr, int start, int end) {
+        boolean neg = false;
+        int i = start;
+        if (i < end && UNSAFE.getByte(addr + i) == '-') { neg = true; i++; }
+        long intPart = 0;
+        while (i < end && UNSAFE.getByte(addr + i) != '.') { intPart = intPart * 10 + (UNSAFE.getByte(addr + i) - '0'); i++; }
+        double result = intPart;
+        if (i < end && UNSAFE.getByte(addr + i) == '.') {
+            i++;
+            long frac = 0; double div = 1;
+            while (i < end) { frac = frac * 10 + (UNSAFE.getByte(addr + i) - '0'); div *= 10; i++; }
             result += frac / div;
         }
         return neg ? -result : result;
