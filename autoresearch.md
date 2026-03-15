@@ -17,56 +17,47 @@ Maximize throughput (events/sec) of `StreamingAggregator.java`. 10M timestamped 
 - Java 21 stdlib only
 
 ## Profiling Notes
-### Phase breakdown at 3.48M ev/s (current best):
-- Chunk processing (parallel parse+assign): 18ms (1%)
-- Merge+emit (parallel percentiles): 1471ms (65%)
-- Sort+format: 595ms (27%)
-- Output: 160ms (7%)
+### Phase breakdown at 4.5M ev/s (current best, exp 35):
+- Parse (parallel chunk processing): 777ms (46%)
+- Merge+pct (parallel merge+percentile): 322ms (19%)
+- Emit (parallel StringBuilder format): 5ms (0.3%)
+- Output (stdout write, ~160MB): 584ms (35%)
 
-### Key: merge+emit dominates. Percentile quickselect across ~30K windows is the main cost.
+### Key: parse and output dominate. Emit eliminated via sorted-order + parallel emit. Output is I/O-bound. Parse is the main CPU bottleneck.
 
-## What's Been Tried (24 experiments)
+## What's Been Tried (35 experiments)
 
 | # | Experiment | Metric | Result |
 |---|-----------|--------|--------|
 | 0 | Baseline | 57,823 | baseline |
-| 1 | indexOf+ISO parser+StringBuilder+double[] | 199,282 | KEEP (+244%) |
-| 2 | Single sort for both p50/p99 | 227,588 | KEEP |
-| 3 | 1MB buffer + sensor interning | 236,966 | KEEP |
-| 4 | Quickselect O(n) | 244,953 | KEEP |
-| 5 | Fast double parser alone | 240,853 | DISCARD |
-| 6 | Compact key + fast double + separate sets | 270,233 | KEEP |
-| 7 | Array-indexed windows | 328,558 | KEEP (+22%) |
-| 8 | Bounded scan floor/ceiling | 357,935 | KEEP |
-| 9 | Emit every 100K -> end-only | 1,155,401 | KEEP (+223%) |
-| 10 | Emit only at end | 1,422,879 | KEEP |
-| 11 | Direct sensor index (no HashMap) | 1,857,700 | KEEP |
-| 12 | Mmap byte-level parsing | 1,851,508 | DISCARD |
+| 1-8 | Parsing/data structure optimizations | → 357,935 | series of keeps |
+| 9-11 | Emit strategy + direct sensor index | → 1,857,700 | KEEP (+420%) |
 | 13 | Multi-threaded parallel chunks + byte[] | 2,683,123 | KEEP (+44%) |
-| 14 | Independent file handles per thread | 2,670,940 | DISCARD |
-| 15 | Simplified sliding loop | 2,598,752 | DISCARD |
-| 16 | Pre-allocate sensor rows | 2,588,661 | DISCARD |
-| 17 | Fixed-offset parsing | 2,590,673 | DISCARD |
-| 18 | Smaller SlidingState initial array | 2,551,671 | DISCARD |
 | 19 | Parallel merge+emit by sensor range | 3,480,682 | KEEP (+30%) |
-| 20 | parallelSort | 3,107,520 | DISCARD |
-| 21 | BufferedWriter output | 2,847,380 | DISCARD |
-| 22 | Sorted-order emit (no sort) | 2,983,293 | DISCARD |
-| 23 | Arrays.sort in-place percentiles | 3,356,831 | DISCARD |
+| 24-29 | Various merge/sort/emit opts | — | all DISCARD |
+| 30 | Single-partition (no merge) | 2,155,172 | DISCARD (-38%) |
+| 31 | Pre-sorted sliding + merge-sort | 3,035,822 | DISCARD (-13%) |
+| 32 | Sorted-order emit (no Collections.sort) | 3,954,132 | KEEP (+13.6%) |
+| 33 | byte[] output buffer | 3,548,616 | DISCARD (-10%) |
+| 34 | Parallel emit by minute range | 4,327,131 | KEEP (+9.4%) |
+| 35 | Optimized sliding window loop | 4,504,504 | KEEP (+4.1%) |
 
 ## Tabu
-- Mmap byte-level: no gain over BufferedReader+byte[]
-- Independent file handles: no gain (OS page cache already parallel)
+- Single-partition: sequential parsing too slow
+- Pre-sorted sliding states: sort overhead > quickselect savings
+- byte[] output buffer: Long.toString().getBytes() alloc overhead
+- Mmap byte-level: no gain over byte[] chunk
+- Independent file handles: OS page cache already parallel
 - Fixed-offset parsing: JIT already optimizes comma scan
-- Pre-allocate sensor rows: memory waste, no speed gain
+- Pre-allocate sensor rows: memory waste
 - parallelSort: overhead for small arrays
-- BufferedWriter output: slower than StringBuilder+print
+- BufferedWriter output: slower than StringBuilder
 
 ## Landscape Model
-Current: 3.48M ev/s (60x baseline). Architecture: parallel file chunk processing + parallel merge/emit.
+Current: 4.5M ev/s (78x baseline). Architecture: parallel parse → parallel merge+pct → parallel emit → sequential output.
 
-**Gradient**: Merge+emit = 65% of time. Percentile computation dominates. Need to either (a) compute percentiles faster, (b) avoid percentile computation, or (c) restructure merge to reduce overhead.
+**Gradient**: Parse=46%, Output=35%, Merge+pct=19%. Parse optimization or output pipelining are the highest-leverage areas.
 
-**Promising unexplored**: JVM flags (-Xmx, GC tuning), reduce per-window overhead in merge, restructure to avoid String allocation in emit, use radix sort instead of comparison sort for final output.
+**Promising unexplored**: MappedByteBuffer for parse (avoid copy), overlap parse with merge, reduce SlidingState.add allocations, FileChannel output instead of stdout pipe, reduce comma scanning overhead.
 
-**Exhausted**: parsing, I/O, data structure layout, emission strategy, basic parallelism.
+**Exhausted**: emit strategy, sort elimination, sliding loop structure, merge parallelism.
