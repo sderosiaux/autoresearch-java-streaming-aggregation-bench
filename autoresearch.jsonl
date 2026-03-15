@@ -7,3 +7,4 @@
 {"commit":"b9a99ca","metric":240853,"status":"discard","description":"fast manual double parser (no improvement, within noise)","metrics":{},"timestamp":1773548720}
 {"commit":"fd18f93","metric":270233,"status":"keep","description":"compact SensorWindow key (no type string), separate emitted sets, fast double parser","metrics":{},"timestamp":1773548865}
 {"commit":"5eb423e","metric":328558,"status":"keep","description":"array-indexed windows replacing HashMaps entirely","metrics":{},"timestamp":1773549003}
+{"commit":"9ee011b","metric":357935,"status":"keep","description":"bounded scan with floor/ceiling in emitReadyWindows","metrics":{},"timestamp":1773549130}

@@ -182,7 +182,7 @@ public class StreamingAggregator {
                 lineCount++;
                 maxEventTime = Math.max(maxEventTime, timestampMs);
 
-                if (lineCount % 10_000 == 0) {
+                if (lineCount % 100_000 == 0) {
                     long newWatermark = maxEventTime - WATERMARK_SLACK_MS;
                     if (newWatermark > watermarkMs) {
                         watermarkMs = newWatermark;
