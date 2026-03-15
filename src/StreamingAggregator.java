@@ -183,15 +183,22 @@ public class StreamingAggregator {
 
         int minutesPerThread = (MAX_MINUTES + nThreads - 1) / nThreads;
 
+        // Shared emit buffers — avoid Arrays.copyOf trim at end of each task
+        byte[][] slidingBufs = new byte[nThreads][];
+        int[] slidingLens = new int[nThreads];
+        byte[][] tumblingBufs = new byte[nThreads][];
+        int[] tumblingLens = new int[nThreads];
+
         // Emit sliding windows — direct byte[] output
         @SuppressWarnings("unchecked")
-        Future<byte[]>[] slidingEmitFutures = new Future[nThreads];
+        Future<?>[] slidingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
+            int tt = t;
             int mStart = t * minutesPerThread;
             int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
             final int fsc = sc;
             slidingEmitFutures[t] = pool.submit(() -> {
-                byte[] buf = new byte[500_000 * 80 / nThreads];
+                byte[] buf = new byte[8 << 20];
                 int pos = 0;
                 for (int m = mStart; m < mEnd; m++) {
                     byte[] pfx = slidingPfx[m];
@@ -209,19 +216,22 @@ public class StreamingAggregator {
                         System.arraycopy(NEW_LINE, 0, buf, pos, NEW_LINE.length); pos += NEW_LINE.length;
                     }
                 }
-                return Arrays.copyOf(buf, pos);
+                slidingBufs[tt] = buf;
+                slidingLens[tt] = pos;
+                return null;
             });
         }
 
         // Emit tumbling windows — direct byte[] output
         @SuppressWarnings("unchecked")
-        Future<byte[]>[] tumblingEmitFutures = new Future[nThreads];
+        Future<?>[] tumblingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
+            int tt = t;
             int mStart = t * minutesPerThread;
             int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
             final int fsc = sc;
             tumblingEmitFutures[t] = pool.submit(() -> {
-                byte[] buf = new byte[500_000 * 80 / nThreads];
+                byte[] buf = new byte[10 << 20];
                 int pos = 0;
                 for (int m = mStart; m < mEnd; m++) {
                     byte[] pfx = tumblingPfx[m];
@@ -245,17 +255,21 @@ public class StreamingAggregator {
                         System.arraycopy(NEW_LINE, 0, buf, pos, NEW_LINE.length); pos += NEW_LINE.length;
                     }
                 }
-                return Arrays.copyOf(buf, pos);
+                tumblingBufs[tt] = buf;
+                tumblingLens[tt] = pos;
+                return null;
             });
         }
 
-        // Output in order: write byte[] chunks directly, avoid double-copy
+        // Output in order: write directly from emit buffers, no trim copy
         BufferedOutputStream bos = new BufferedOutputStream(System.out, 1 << 20);
-        for (Future<byte[]> f : slidingEmitFutures) {
-            bos.write(f.get());
+        for (int t = 0; t < nThreads; t++) {
+            slidingEmitFutures[t].get();
+            bos.write(slidingBufs[t], 0, slidingLens[t]);
         }
-        for (Future<byte[]> f : tumblingEmitFutures) {
-            bos.write(f.get());
+        for (int t = 0; t < nThreads; t++) {
+            tumblingEmitFutures[t].get();
+            bos.write(tumblingBufs[t], 0, tumblingLens[t]);
         }
         bos.flush();
 
@@ -310,8 +324,8 @@ public class StreamingAggregator {
                         p += merged[k].size;
                     }
                 }
-                int i99 = Math.max(0, (int) Math.ceil(99.0 / 100.0 * totalSize) - 1);
-                int i50 = Math.max(0, (int) Math.ceil(50.0 / 100.0 * totalSize) - 1);
+                int i99 = Math.max(0, (99 * totalSize + 99) / 100 - 1);
+                int i50 = Math.max(0, (totalSize + 1) / 2 - 1);
                 double p99 = TumblingState.quickselect(combined, 0, totalSize - 1, i99);
                 double p50 = TumblingState.quickselect(combined, 0, i99, i50);
                 slidingPcts[m][s] = new double[]{p50, p99};
