@@ -12,8 +12,10 @@ public class StreamingAggregator {
     private static final int[] DAYS_CUM = {0,31,59,90,120,151,181,212,243,273,304,334};
     private static final int[] DAYS_CUM_LEAP = {0,31,60,91,121,152,182,213,244,274,305,335};
 
-    // Compact key: no windowType string (separate maps for tumbling/sliding)
-    record SensorWindow(String sensorId, long windowStartMs) {}
+    // Array-indexed window storage
+    // Data spans ~24h + 10min late buffer = ~1450 minutes. Use 1500 for safety.
+    static final int MAX_MINUTES = 1500;
+    static final int MAX_SENSORS = 1100; // DataGenerator uses 1000, with buffer
 
     static class TumblingState {
         long count = 0;
@@ -79,10 +81,16 @@ public class StreamingAggregator {
         }
     }
 
-    private final Map<SensorWindow, TumblingState> tumblingWindows = new HashMap<>();
-    private final Map<SensorWindow, SlidingState> slidingWindows = new HashMap<>();
-    private final Set<SensorWindow> emittedTumbling = new HashSet<>();
-    private final Set<SensorWindow> emittedSliding = new HashSet<>();
+    // Flat arrays indexed by [sensorIdx][minuteIdx]
+    private TumblingState[][] tumblingArr;
+    private SlidingState[][] slidingArr;
+    private boolean[][] emittedTumbling;
+    private boolean[][] emittedSliding;
+    private final HashMap<String, Integer> sensorIndex = new HashMap<>(2048);
+    private final String[] sensorNames = new String[MAX_SENSORS];
+    private int sensorCount = 0;
+    private long baseMs; // epoch ms of earliest minute bucket
+    private boolean baseSet = false;
     private final List<String> results = new ArrayList<>();
     private long watermarkMs = Long.MIN_VALUE;
 
@@ -94,8 +102,55 @@ public class StreamingAggregator {
         new StreamingAggregator().run(args[0]);
     }
 
+    private int getSensorIdx(String sensorId) {
+        Integer idx = sensorIndex.get(sensorId);
+        if (idx != null) return idx;
+        int i = sensorCount++;
+        sensorIndex.put(sensorId, i);
+        sensorNames[i] = sensorId;
+        return i;
+    }
+
+    private int minuteIdx(long ms) {
+        return (int) ((ms - baseMs) / 60_000);
+    }
+
+    private void ensureArrays(int minIdx) {
+        // Lazy-allocate on first event
+        if (tumblingArr == null) {
+            int size = MAX_MINUTES;
+            tumblingArr = new TumblingState[MAX_SENSORS][];
+            slidingArr = new SlidingState[MAX_SENSORS][];
+            emittedTumbling = new boolean[MAX_SENSORS][];
+            emittedSliding = new boolean[MAX_SENSORS][];
+        }
+    }
+
+    private TumblingState getTumblingState(int sensor, int minute) {
+        if (tumblingArr[sensor] == null) {
+            tumblingArr[sensor] = new TumblingState[MAX_MINUTES];
+        }
+        TumblingState s = tumblingArr[sensor][minute];
+        if (s == null) {
+            s = new TumblingState();
+            tumblingArr[sensor][minute] = s;
+        }
+        return s;
+    }
+
+    private SlidingState getSlidingState(int sensor, int minute) {
+        if (slidingArr[sensor] == null) {
+            slidingArr[sensor] = new SlidingState[MAX_MINUTES];
+        }
+        SlidingState s = slidingArr[sensor][minute];
+        if (s == null) {
+            s = new SlidingState();
+            slidingArr[sensor][minute] = s;
+        }
+        return s;
+    }
+
     void run(String inputFile) throws IOException {
-        HashMap<String, String> sensorIntern = new HashMap<>(2048);
         try (BufferedReader reader = new BufferedReader(new FileReader(inputFile), 1 << 20)) {
             String line;
             long lineCount = 0;
@@ -109,9 +164,17 @@ public class StreamingAggregator {
 
                 long timestampMs = parseIsoTimestamp(line, c1);
                 if (timestampMs < 0) continue;
-                String rawSensor = line.substring(c1 + 1, c2);
-                String sensorId = sensorIntern.computeIfAbsent(rawSensor, k -> k);
+                String sensorId = line.substring(c1 + 1, c2);
                 double value = parseFastDouble(line, c2 + 1, line.length());
+
+                if (!baseSet) {
+                    // Set base to 15 minutes before first event to handle late data
+                    baseMs = (timestampMs / 60_000 - 15) * 60_000;
+                    baseSet = true;
+                    ensureArrays(0);
+                }
+
+                int sIdx = getSensorIdx(sensorId);
 
                 lineCount++;
                 maxEventTime = Math.max(maxEventTime, timestampMs);
@@ -125,8 +188,10 @@ public class StreamingAggregator {
                 }
 
                 long tumblingStart = timestampMs - (timestampMs % TUMBLING_WINDOW_MS);
-                SensorWindow tKey = new SensorWindow(sensorId, tumblingStart);
-                tumblingWindows.computeIfAbsent(tKey, k -> new TumblingState()).add(value);
+                int tMinute = minuteIdx(tumblingStart);
+                if (tMinute >= 0 && tMinute < MAX_MINUTES) {
+                    getTumblingState(sIdx, tMinute).add(value);
+                }
 
                 long firstSlidingStart = timestampMs - SLIDING_WINDOW_MS + SLIDING_STEP_MS;
                 firstSlidingStart = firstSlidingStart - (firstSlidingStart % SLIDING_STEP_MS);
@@ -135,8 +200,10 @@ public class StreamingAggregator {
                 for (long wStart = firstSlidingStart; wStart <= timestampMs; wStart += SLIDING_STEP_MS) {
                     long wEnd = wStart + SLIDING_WINDOW_MS;
                     if (timestampMs >= wStart && timestampMs < wEnd) {
-                        SensorWindow sKey = new SensorWindow(sensorId, wStart);
-                        slidingWindows.computeIfAbsent(sKey, k -> new SlidingState()).add(value);
+                        int sMinute = minuteIdx(wStart);
+                        if (sMinute >= 0 && sMinute < MAX_MINUTES) {
+                            getSlidingState(sIdx, sMinute).add(value);
+                        }
                     }
                 }
             }
@@ -223,20 +290,27 @@ public class StreamingAggregator {
     private void emitReadyWindows() {
         StringBuilder sb = new StringBuilder(128);
 
-        Iterator<Map.Entry<SensorWindow, TumblingState>> tIt = tumblingWindows.entrySet().iterator();
-        while (tIt.hasNext()) {
-            Map.Entry<SensorWindow, TumblingState> entry = tIt.next();
-            SensorWindow key = entry.getKey();
-            long windowEnd = key.windowStartMs + TUMBLING_WINDOW_MS;
+        for (int s = 0; s < sensorCount; s++) {
+            if (tumblingArr[s] == null) continue;
+            if (emittedTumbling[s] == null) emittedTumbling[s] = new boolean[MAX_MINUTES];
+            TumblingState[] arr = tumblingArr[s];
+            boolean[] emitted = emittedTumbling[s];
+            String sensor = sensorNames[s];
 
-            if (windowEnd <= watermarkMs) {
-                TumblingState state = entry.getValue();
-                boolean updated = emittedTumbling.contains(key);
-                emittedTumbling.add(key);
+            for (int m = 0; m < MAX_MINUTES; m++) {
+                TumblingState state = arr[m];
+                if (state == null) continue;
+
+                long windowStart = baseMs + (long) m * 60_000;
+                long windowEnd = windowStart + TUMBLING_WINDOW_MS;
+                if (windowEnd > watermarkMs) continue;
+
+                boolean updated = emitted[m];
+                emitted[m] = true;
 
                 sb.setLength(0);
-                sb.append("tumbling,").append(key.windowStartMs).append(',')
-                  .append(key.sensorId).append(',')
+                sb.append("tumbling,").append(windowStart).append(',')
+                  .append(sensor).append(',')
                   .append(state.count).append(',');
                 appendDouble(sb, state.sum); sb.append(',');
                 appendDouble(sb, state.min); sb.append(',');
@@ -246,33 +320,40 @@ public class StreamingAggregator {
                 results.add(sb.toString());
 
                 if (windowEnd + ALLOWED_LATENESS_MS <= watermarkMs) {
-                    tIt.remove();
+                    arr[m] = null;
                 }
             }
         }
 
-        Iterator<Map.Entry<SensorWindow, SlidingState>> sIt = slidingWindows.entrySet().iterator();
-        while (sIt.hasNext()) {
-            Map.Entry<SensorWindow, SlidingState> entry = sIt.next();
-            SensorWindow key = entry.getKey();
-            long windowEnd = key.windowStartMs + SLIDING_WINDOW_MS;
+        for (int s = 0; s < sensorCount; s++) {
+            if (slidingArr[s] == null) continue;
+            if (emittedSliding[s] == null) emittedSliding[s] = new boolean[MAX_MINUTES];
+            SlidingState[] arr = slidingArr[s];
+            boolean[] emitted = emittedSliding[s];
+            String sensor = sensorNames[s];
 
-            if (windowEnd <= watermarkMs) {
-                SlidingState state = entry.getValue();
-                boolean updated = emittedSliding.contains(key);
-                emittedSliding.add(key);
+            for (int m = 0; m < MAX_MINUTES; m++) {
+                SlidingState state = arr[m];
+                if (state == null) continue;
+
+                long windowStart = baseMs + (long) m * 60_000;
+                long windowEnd = windowStart + SLIDING_WINDOW_MS;
+                if (windowEnd > watermarkMs) continue;
+
+                boolean updated = emitted[m];
+                emitted[m] = true;
 
                 double[] pcts = state.percentiles();
                 sb.setLength(0);
-                sb.append("sliding,").append(key.windowStartMs).append(',')
-                  .append(key.sensorId).append(',');
+                sb.append("sliding,").append(windowStart).append(',')
+                  .append(sensor).append(',');
                 appendDouble(sb, pcts[0]); sb.append(',');
                 appendDouble(sb, pcts[1]); sb.append(',');
                 sb.append(updated ? "updated" : "new");
                 results.add(sb.toString());
 
                 if (windowEnd + ALLOWED_LATENESS_MS <= watermarkMs) {
-                    sIt.remove();
+                    arr[m] = null;
                 }
             }
         }
