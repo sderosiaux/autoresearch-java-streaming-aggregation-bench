@@ -185,9 +185,9 @@ public class StreamingAggregator {
         // Output order: all sliding by (minute, sensor), then all tumbling by (minute, sensor)
         int minutesPerThread = (MAX_MINUTES + nThreads - 1) / nThreads;
 
-        // Emit sliding windows in parallel
+        // Emit sliding windows in parallel — produce byte[] directly
         @SuppressWarnings("unchecked")
-        Future<StringBuilder>[] slidingEmitFutures = new Future[nThreads];
+        Future<byte[]>[] slidingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
             int mStart = t * minutesPerThread;
             int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
@@ -208,13 +208,13 @@ public class StreamingAggregator {
                         out.append(sb2);
                     }
                 }
-                return out;
+                return out.toString().getBytes();
             });
         }
 
-        // Emit tumbling windows in parallel
+        // Emit tumbling windows in parallel — produce byte[] directly
         @SuppressWarnings("unchecked")
-        Future<StringBuilder>[] tumblingEmitFutures = new Future[nThreads];
+        Future<byte[]>[] tumblingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
             int mStart = t * minutesPerThread;
             int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
@@ -237,19 +237,17 @@ public class StreamingAggregator {
                         out.append(sb2);
                     }
                 }
-                return out;
+                return out.toString().getBytes();
             });
         }
 
-        // Output in order: sliding chunks first, then tumbling chunks
+        // Output in order: write byte[] chunks directly, avoid double-copy
         BufferedOutputStream bos = new BufferedOutputStream(System.out, 1 << 20);
-        for (Future<StringBuilder> f : slidingEmitFutures) {
-            String s = f.get().toString();
-            bos.write(s.getBytes());
+        for (Future<byte[]> f : slidingEmitFutures) {
+            bos.write(f.get());
         }
-        for (Future<StringBuilder> f : tumblingEmitFutures) {
-            String s = f.get().toString();
-            bos.write(s.getBytes());
+        for (Future<byte[]> f : tumblingEmitFutures) {
+            bos.write(f.get());
         }
         bos.flush();
 

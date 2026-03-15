@@ -38,3 +38,7 @@
 {"commit":"107feb3","metric":3548616,"status":"discard","description":"byte[] output buffer with Long.toString().getBytes(): 10% slower, alloc overhead","metrics":{},"timestamp":1773552623}
 {"commit":"107feb3","metric":4327131,"status":"keep","description":"parallel emit by minute range + BufferedOutputStream (4327131 ev/s, +9.4%)","metrics":{},"timestamp":1773552726}
 {"commit":"8d5211c","metric":4504504,"status":"keep","description":"optimized sliding window loop: int minute iteration, no modulo, no redundant checks (4504504 ev/s, +4.1%)","metrics":{},"timestamp":1773552865}
+{"commit":"33db179","metric":27322404,"status":"crash","description":"fixed-offset comma: CORRECTNESS FAIL, sliding window minute calc wrong","metrics":{},"timestamp":1773552959}
+{"commit":"33db179","metric":27173913,"status":"crash","description":"fixed-offset comma (corrected): still CORRECTNESS FAIL, sliding window bug","metrics":{},"timestamp":1773553033}
+{"commit":"33db179","metric":4498425,"status":"discard","description":"fixed-offset first comma (Z-aware): no improvement, within noise","metrics":{},"timestamp":1773553102}
+{"commit":"33db179","metric":4928536,"status":"keep","description":"parallel byte[] conversion in emit threads (4928536 ev/s, +9.4%)","metrics":{},"timestamp":1773553210}
