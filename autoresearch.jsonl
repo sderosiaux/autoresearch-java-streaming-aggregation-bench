@@ -1,4 +1,4 @@
-{"type":"config","name":"streaming-throughput","metricName":"throughput","metricUnit":"events/sec","bestDirection":"higher","maxExperiments":100}
+{"type":"config","name":"streaming-throughput","metricName":"throughput","metricUnit":"events/sec","bestDirection":"higher","maxExperiments":200}
 {"commit":"2ba3ded","metric":57823,"status":"keep","description":"baseline: naive single-threaded, Instant.parse, String.split, ArrayList percentiles","metrics":{},"timestamp":1773548163}
 {"commit":"4ea38d0","metric":199282,"status":"keep","description":"indexOf parsing, manual ISO timestamp, StringBuilder output, double[] sliding state","metrics":{},"timestamp":1773548426}
 {"commit":"8ffd82d","metric":227588,"status":"keep","description":"single sort for both p50/p99 percentiles","metrics":{},"timestamp":1773548497}
@@ -103,3 +103,16 @@
 {"commit":"6e8add8","metric":8244023,"status":"discard","description":"experiment: inline newline suffix as direct byte writes — arraycopy overhead for 5 bytes is negligible (+0.0%, noise)","metrics":{},"timestamp":1773588097}
 {"commit":"c003ffa","metric":8536103,"status":"keep","description":"experiment: eliminate slidingPcts — compute percentiles inline during emit (8536103 ev/s, +3.5%)","metrics":{},"timestamp":1773588265}
 {"commit":"c003ffa","metric":8517887,"status":"discard","description":"experiment: unroll 5-minute sliding k-loop — JIT already optimizes the loop, manual unrolling adds code bloat (-0.2%, noise)","metrics":{},"timestamp":1773588527}
+{"commit":"573a2f5","metric":9154010,"status":"keep","description":"experiment: direct mmap parsing via Unsafe — eliminate 384MB heap copy (9154010 ev/s, +7.2%)","metrics":{},"timestamp":1773588927}
+{"commit":"573a2f5","metric":8257638,"status":"discard","description":"experiment: minute-range merge parallelism — direct mergedTumbling writes cause cache thrashing vs sensor-range with temp array (-9.8%)","metrics":{},"timestamp":1773589184}
+{"commit":"573a2f5","metric":7949125,"status":"discard","description":"experiment: fused sliding+tumbling emit — per-task working set too large, cache thrashing (-13.2%)","metrics":{},"timestamp":1773589337}
+{"commit":"573a2f5","metric":8847763,"status":"discard","description":"experiment: remove median-of-3 pivot in quickselect — worse pivot quality increases iteration count (-3.3%)","metrics":{},"timestamp":1773589415}
+{"commit":"573a2f5","metric":9099181,"status":"discard","description":"experiment: hardcode c2=c1+12 + unrolled 4-digit sensor index — eliminates 3 branch checks but JIT already predicts the pattern (-0.6%, noise)","metrics":{},"timestamp":1773590130}
+{"commit":"573a2f5","metric":7374631,"status":"discard","description":"experiment: insertion sort for small sliding windows (N≤32) — O(N²) comparisons worse than two quickselect calls with partial partition reuse (-19.4%)","metrics":{},"timestamp":1773590193}
+{"commit":"573a2f5","metric":8347245,"status":"discard","description":"experiment: merge directly into mergedTumbling (no temp array) — cache contention between threads on shared rows, same failure as minute-range merge (-8.8%)","metrics":{},"timestamp":1773590233}
+{"commit":"573a2f5","metric":8960573,"status":"discard","description":"experiment: eliminate newline scan + inline value parse — high variance (8.5-10.5M), 5-run median below baseline, JIT inconsistency with inline parse (-2.1%)","metrics":{},"timestamp":1773590422}
+{"commit":"573a2f5","metric":9216589,"status":"keep","description":"experiment: single file-wide mmap shared across all threads — 1 syscall vs 12, reduced TLB pressure, simpler code (9216589 ev/s, +0.7%)","metrics":{},"timestamp":1773590560}
+{"commit":"4928a3e","metric":8802816,"status":"discard","description":"experiment: write tumbling output first — output I/O evicts cache lines sliding still reads (-4.5%)","metrics":{},"timestamp":1773590683}
+{"commit":"4928a3e","metric":8787346,"status":"discard","description":"experiment: 4MB output buffer — larger buffer evicts cache, negates reduced syscalls (-4.7%)","metrics":{},"timestamp":1773590714}
+{"commit":"4928a3e","metric":7429420,"status":"discard","description":"experiment: fused merge+sliding with sensor-range parallelism — sliding reads ALL minutes per sensor causing poor cache locality vs minute-range (-19.4%)","metrics":{},"timestamp":1773591109}
+{"commit":"4928a3e","metric":6887052,"status":"discard","description":"experiment: pre-sort values during merge — O(n log n) sort overhead per minute far exceeds quickselect savings (-25%)","metrics":{},"timestamp":1773591309}

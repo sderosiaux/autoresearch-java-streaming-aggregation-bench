@@ -16,18 +16,6 @@ public class StreamingAggregator {
     static final int MAX_MINUTES = 1500;
     static final int MAX_SENSORS = 1100;
 
-    @SuppressWarnings("removal")
-    private static final sun.misc.Unsafe UNSAFE;
-    private static final long BUF_ADDR_OFFSET;
-    static {
-        try {
-            java.lang.reflect.Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            UNSAFE = (sun.misc.Unsafe) f.get(null);
-            BUF_ADDR_OFFSET = UNSAFE.objectFieldOffset(Buffer.class.getDeclaredField("address"));
-        } catch (Exception e) { throw new RuntimeException(e); }
-    }
-
     // Unified state: tumbling aggregates + raw values for sliding percentiles
     static class TumblingState {
         long count = 0;
@@ -106,6 +94,9 @@ public class StreamingAggregator {
         long fileSize = raf.length();
         FileChannel channel = raf.getChannel();
 
+        // Single mmap of entire file
+        MappedByteBuffer mbb = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize);
+
         // Find line-aligned chunk boundaries
         long[] boundaries = new long[nThreads + 1];
         boundaries[0] = 0;
@@ -113,41 +104,43 @@ public class StreamingAggregator {
 
         byte[] scanBuf = new byte[4096];
         for (int i = 1; i < nThreads; i++) {
-            long approx = fileSize * i / nThreads;
-            raf.seek(approx);
-            int read = raf.read(scanBuf);
+            int approx = (int)(fileSize * i / nThreads);
+            mbb.get(approx, scanBuf, 0, Math.min(4096, (int)(fileSize - approx)));
             int nl = -1;
-            for (int j = 0; j < read; j++) {
+            for (int j = 0; j < scanBuf.length; j++) {
                 if (scanBuf[j] == '\n') { nl = j; break; }
             }
             boundaries[i] = (nl >= 0) ? approx + nl + 1 : approx;
         }
 
         // Determine baseMs from first line
-        raf.seek(0);
         byte[] firstLine = new byte[128];
-        raf.read(firstLine);
+        mbb.get(0, firstLine, 0, 128);
         long firstTs = parseIsoBytesArr(firstLine, 0);
         long baseMs = (firstTs / 60_000 - 15) * 60_000;
 
-        // Process chunks in parallel
+        // Process chunks in parallel — parse directly from MappedByteBuffer (zero copy)
         ExecutorService pool = Executors.newFixedThreadPool(nThreads);
         Future<PartitionState>[] futures = new Future[nThreads];
 
         for (int t = 0; t < nThreads; t++) {
-            long start = boundaries[t];
-            long end = boundaries[t + 1];
+            final int chunkStart = (int)boundaries[t];
+            final int chunkEnd = (int)boundaries[t + 1];
             final long bMs = baseMs;
-            futures[t] = pool.submit(() -> processChunk(channel, start, end, bMs));
+            futures[t] = pool.submit(() -> processChunkMBB(mbb, chunkStart, chunkEnd, bMs));
         }
 
         // Collect partition states
         PartitionState[] parts = new PartitionState[nThreads];
         String[] sensorNames = new String[MAX_SENSORS];
         int sensorCount = 0;
+        int globalMinMinute = MAX_MINUTES;
+        int globalMaxMinute = -1;
         for (int t = 0; t < nThreads; t++) {
             parts[t] = futures[t].get();
             if (parts[t].sensorCount > sensorCount) sensorCount = parts[t].sensorCount;
+            if (parts[t].minMinute < globalMinMinute) globalMinMinute = parts[t].minMinute;
+            if (parts[t].maxMinute > globalMaxMinute) globalMaxMinute = parts[t].maxMinute;
             for (int s = 0; s < parts[t].sensorCount; s++) {
                 if (parts[t].sensorNames[s] != null && sensorNames[s] == null) {
                     sensorNames[s] = parts[t].sensorNames[s];
@@ -158,11 +151,14 @@ public class StreamingAggregator {
         final int sc = sensorCount;
         final String[] sNames = sensorNames;
         final long bMs = baseMs;
+        final int gMin = globalMinMinute;
+        final int gMax = globalMaxMinute;
         int sensorsPerThread = (sc + nThreads - 1) / nThreads;
 
         // Shared merged array — [minute][sensor] layout for cache-friendly emit
+        // Only allocate for the actual used range [gMin..gMax]
         TumblingState[][] mergedTumbling = new TumblingState[MAX_MINUTES][];
-        for (int m = 0; m < MAX_MINUTES; m++) {
+        for (int m = gMin; m <= gMax; m++) {
             mergedTumbling[m] = new TumblingState[sc];
         }
 
@@ -178,9 +174,10 @@ public class StreamingAggregator {
         for (Future<?> f : mergeFutures) f.get();
 
         // Pre-compute prefixes as byte[] and sensor names as byte[]
+        int pfxMin = Math.max(0, gMin - 4);
         byte[][] slidingPfx = new byte[MAX_MINUTES][];
         byte[][] tumblingPfx = new byte[MAX_MINUTES][];
-        for (int m = 0; m < MAX_MINUTES; m++) {
+        for (int m = pfxMin; m <= gMax; m++) {
             long ws = bMs + (long) m * 60_000;
             slidingPfx[m] = ("sliding," + ws + ",").getBytes();
             tumblingPfx[m] = ("tumbling," + ws + ",").getBytes();
@@ -191,7 +188,10 @@ public class StreamingAggregator {
         }
         byte[] NEW_LINE = ",new\n".getBytes();
 
-        int minutesPerThread = (MAX_MINUTES + nThreads - 1) / nThreads;
+        // Sliding windows can start up to 4 minutes before first data
+        final int emitMin = Math.max(0, gMin - 4);
+        int minuteRange = gMax - emitMin + 1;
+        int minutesPerThread = (minuteRange + nThreads - 1) / nThreads;
 
         // Shared emit buffers — avoid Arrays.copyOf trim at end of each task
         byte[][] slidingBufs = new byte[nThreads][];
@@ -204,8 +204,8 @@ public class StreamingAggregator {
         Future<?>[] slidingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
             int tt = t;
-            int mStart = t * minutesPerThread;
-            int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
+            int mStart = emitMin + t * minutesPerThread;
+            int mEnd = Math.min(mStart + minutesPerThread, gMax + 1);
             final int fsc = sc;
             slidingEmitFutures[t] = pool.submit(() -> {
                 byte[] buf = new byte[8 << 20];
@@ -213,24 +213,28 @@ public class StreamingAggregator {
                 double[] combinedBuf = new double[1024];
                 for (int m = mStart; m < mEnd; m++) {
                     byte[] pfx = slidingPfx[m];
-                    int kEnd = Math.min(m + 4, MAX_MINUTES - 1);
+                    int kEnd = Math.min(m + 4, gMax);
                     for (int s = 0; s < fsc; s++) {
-                        int totalSize = 0;
-                        for (int k = m; k <= kEnd; k++) {
-                            TumblingState ts = mergedTumbling[k][s];
-                            if (ts != null) totalSize += ts.size;
-                        }
-                        if (totalSize == 0) continue;
-                        if (totalSize > combinedBuf.length) combinedBuf = new double[totalSize];
+                        // Single pass: copy values and count in one loop
                         double[] combined = combinedBuf;
                         int p = 0;
                         for (int k = m; k <= kEnd; k++) {
-                            TumblingState ts = mergedTumbling[k][s];
+                            TumblingState[] row = mergedTumbling[k];
+                            TumblingState ts = (row != null) ? row[s] : null;
                             if (ts != null) {
-                                System.arraycopy(ts.values, 0, combined, p, ts.size);
-                                p += ts.size;
+                                int sz = ts.size;
+                                int needed = p + sz;
+                                if (needed > combined.length) {
+                                    combinedBuf = new double[needed * 2];
+                                    System.arraycopy(combined, 0, combinedBuf, 0, p);
+                                    combined = combinedBuf;
+                                }
+                                System.arraycopy(ts.values, 0, combined, p, sz);
+                                p += sz;
                             }
                         }
+                        if (p == 0) continue;
+                        int totalSize = p;
                         int i99 = Math.max(0, (99 * totalSize + 99) / 100 - 1);
                         int i50 = Math.max(0, (totalSize + 1) / 2 - 1);
                         double p99 = TumblingState.quickselect(combined, 0, totalSize - 1, i99);
@@ -256,15 +260,16 @@ public class StreamingAggregator {
         Future<?>[] tumblingEmitFutures = new Future[nThreads];
         for (int t = 0; t < nThreads; t++) {
             int tt = t;
-            int mStart = t * minutesPerThread;
-            int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
+            int mStart = emitMin + t * minutesPerThread;
+            int mEnd = Math.min(mStart + minutesPerThread, gMax + 1);
             final int fsc = sc;
             tumblingEmitFutures[t] = pool.submit(() -> {
                 byte[] buf = new byte[10 << 20];
                 int pos = 0;
                 for (int m = mStart; m < mEnd; m++) {
-                    byte[] pfx = tumblingPfx[m];
                     TumblingState[] tRow = mergedTumbling[m];
+                    if (tRow == null) continue;
+                    byte[] pfx = tumblingPfx[m];
                     for (int s = 0; s < fsc; s++) {
                         TumblingState state = tRow[s];
                         if (state == null) continue;
@@ -309,87 +314,87 @@ public class StreamingAggregator {
 
     static void mergePartitions(PartitionState[] parts, int sStart, int sEnd,
                                 TumblingState[][] mergedTumbling) {
-        int globalMin = MAX_MINUTES, globalMax = -1;
-        for (PartitionState ps : parts) {
-            if (ps.minMinute < globalMin) globalMin = ps.minMinute;
-            if (ps.maxMinute > globalMax) globalMax = ps.maxMinute;
-        }
-        if (globalMax < 0) return;
-
+        // Merge directly into mergedTumbling — no intermediate array
         for (int s = sStart; s < sEnd; s++) {
-            TumblingState[] merged = new TumblingState[MAX_MINUTES];
-            boolean hasData = false;
             for (PartitionState ps : parts) {
                 int lo = ps.minMinute, hi = ps.maxMinute;
                 for (int m = lo; m <= hi; m++) {
                     TumblingState[] tRow = ps.tumbling[m];
                     if (tRow != null && tRow[s] != null) {
-                        hasData = true;
-                        if (merged[m] == null) merged[m] = tRow[s];
-                        else merged[m].merge(tRow[s]);
+                        TumblingState[] mRow = mergedTumbling[m];
+                        if (mRow[s] == null) mRow[s] = tRow[s];
+                        else mRow[s].merge(tRow[s]);
                     }
                 }
-            }
-            if (!hasData) continue;
-            for (int m = globalMin; m <= globalMax; m++) {
-                if (merged[m] != null) mergedTumbling[m][s] = merged[m];
             }
         }
     }
 
-    static PartitionState processChunk(FileChannel channel, long start, long end, long baseMs) throws IOException {
+    static PartitionState processChunkMBB(MappedByteBuffer mbb, int chunkStart, int chunkEnd, long baseMs) {
         PartitionState ps = new PartitionState();
         ps.baseMs = baseMs;
 
-        long size = end - start;
-        if (size <= 0) return ps;
+        if (chunkStart >= chunkEnd) return ps;
 
-        // mmap without heap copy — parse directly from mapped memory via Unsafe
-        java.nio.MappedByteBuffer mbb = channel.map(FileChannel.MapMode.READ_ONLY, start, Math.min(size, Integer.MAX_VALUE));
-        long addr = UNSAFE.getLong(mbb, BUF_ADDR_OFFSET);
-        int limit = (int) Math.min(size, Integer.MAX_VALUE);
-
-        // Precompute date→minute offset from first event in this chunk
-        long firstChunkTs = parseIsoUnsafe(addr, 0);
+        // Parse first timestamp to compute day offset
+        int hour0 = (mbb.get(chunkStart + 11) - '0') * 10 + (mbb.get(chunkStart + 12) - '0');
+        int minute0 = (mbb.get(chunkStart + 14) - '0') * 10 + (mbb.get(chunkStart + 15) - '0');
+        int year = (mbb.get(chunkStart) - '0') * 1000 + (mbb.get(chunkStart+1) - '0') * 100
+                 + (mbb.get(chunkStart+2) - '0') * 10 + (mbb.get(chunkStart+3) - '0');
+        int month = (mbb.get(chunkStart+5) - '0') * 10 + (mbb.get(chunkStart+6) - '0');
+        int day = (mbb.get(chunkStart+8) - '0') * 10 + (mbb.get(chunkStart+9) - '0');
+        int second = (mbb.get(chunkStart+17) - '0') * 10 + (mbb.get(chunkStart+18) - '0');
+        long totalDays = 365L * (year - 1970);
+        totalDays += countLeapYears(year - 1) - countLeapYears(1969);
+        boolean leap = (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
+        totalDays += (leap ? DAYS_CUM_LEAP : DAYS_CUM)[month - 1] + day - 1;
+        long firstChunkTs = ((totalDays * 24 + hour0) * 60 + minute0) * 60000L + second * 1000L;
         int baseDayMinutes = (int)(firstChunkTs / 60_000) - (int)(firstChunkTs / 60_000) % 1440;
         int baseMinute = (int)(baseMs / 60_000);
         int dayOffset = baseDayMinutes - baseMinute;
 
-        int pos = 0;
-        while (pos < limit) {
+        byte[] sensorBuf = new byte[11]; // "sensor_XXXX"
+
+        int pos = chunkStart;
+        while (pos < chunkEnd) {
             int lineStart = pos;
             pos += 31;
-            while (pos < limit && UNSAFE.getByte(addr + pos) != '\n') pos++;
+            while (pos < chunkEnd && mbb.get(pos) != '\n') pos++;
             int lineEnd = pos;
             pos++;
 
             if (lineEnd - lineStart < 22) continue;
 
             int c1 = lineStart + 20;
-            int c2;
-            if (UNSAFE.getByte(addr + c1 + 9) == ',') c2 = c1 + 9;
-            else if (UNSAFE.getByte(addr + c1 + 10) == ',') c2 = c1 + 10;
-            else if (UNSAFE.getByte(addr + c1 + 11) == ',') c2 = c1 + 11;
-            else c2 = c1 + 12;
+            int c2 = c1 + 12;
 
-            int hour = (UNSAFE.getByte(addr + lineStart + 11) - '0') * 10 + (UNSAFE.getByte(addr + lineStart + 12) - '0');
-            int minute = (UNSAFE.getByte(addr + lineStart + 14) - '0') * 10 + (UNSAFE.getByte(addr + lineStart + 15) - '0');
+            int hour = (mbb.get(lineStart + 11) - '0') * 10 + (mbb.get(lineStart + 12) - '0');
+            int minute = (mbb.get(lineStart + 14) - '0') * 10 + (mbb.get(lineStart + 15) - '0');
 
-            int sIdx = 0;
-            for (int i = c1 + 8; i < c2; i++) {
-                sIdx = sIdx * 10 + (UNSAFE.getByte(addr + i) - '0');
-            }
-            if (sIdx >= MAX_SENSORS) continue;
+            int sIdx = (mbb.get(c1 + 8) - '0') * 1000 + (mbb.get(c1 + 9) - '0') * 100
+                     + (mbb.get(c1 + 10) - '0') * 10 + (mbb.get(c1 + 11) - '0');
 
             if (ps.sensorNames[sIdx] == null) {
-                int nameLen = c2 - c1 - 1;
-                byte[] nameBytes = new byte[nameLen];
-                for (int j = 0; j < nameLen; j++) nameBytes[j] = UNSAFE.getByte(addr + c1 + 1 + j);
-                ps.sensorNames[sIdx] = new String(nameBytes);
+                mbb.get(c1 + 1, sensorBuf, 0, 11);
+                ps.sensorNames[sIdx] = new String(sensorBuf);
                 if (sIdx >= ps.sensorCount) ps.sensorCount = sIdx + 1;
             }
 
-            double value = parseDoubleUnsafe(addr, c2 + 1, lineEnd);
+            // Inline double parsing from MappedByteBuffer
+            int di = c2 + 1;
+            boolean neg = false;
+            byte db = mbb.get(di);
+            if (db == '-') { neg = true; di++; db = mbb.get(di); }
+            long intPart = 0;
+            while (db != '.' && di < lineEnd) { intPart = intPart * 10 + (db - '0'); di++; if (di < lineEnd) db = mbb.get(di); }
+            double value = intPart;
+            if (di < lineEnd && db == '.') {
+                di++;
+                long frac = 0; double div = 1;
+                while (di < lineEnd) { frac = frac * 10 + (mbb.get(di) - '0'); div *= 10; di++; }
+                value += frac / div;
+            }
+            if (neg) value = -value;
 
             int eventMinute = dayOffset + hour * 60 + minute;
 
@@ -404,7 +409,6 @@ public class StreamingAggregator {
             }
         }
 
-        java.lang.ref.Reference.reachabilityFence(mbb);
         return ps;
     }
 
@@ -425,52 +429,6 @@ public class StreamingAggregator {
     private static long countLeapYears(int y) {
         if (y < 0) return 0;
         return y / 4 - y / 100 + y / 400;
-    }
-
-    private static double parseDoubleBytesArr(byte[] b, int start, int end) {
-        boolean neg = false;
-        int i = start;
-        if (i < end && b[i] == '-') { neg = true; i++; }
-        long intPart = 0;
-        while (i < end && b[i] != '.') { intPart = intPart * 10 + (b[i] - '0'); i++; }
-        double result = intPart;
-        if (i < end && b[i] == '.') {
-            i++;
-            long frac = 0; double div = 1;
-            while (i < end) { frac = frac * 10 + (b[i] - '0'); div *= 10; i++; }
-            result += frac / div;
-        }
-        return neg ? -result : result;
-    }
-
-    private static long parseIsoUnsafe(long addr, int off) {
-        int year = (UNSAFE.getByte(addr+off) - '0') * 1000 + (UNSAFE.getByte(addr+off+1) - '0') * 100 + (UNSAFE.getByte(addr+off+2) - '0') * 10 + (UNSAFE.getByte(addr+off+3) - '0');
-        int month = (UNSAFE.getByte(addr+off+5) - '0') * 10 + (UNSAFE.getByte(addr+off+6) - '0');
-        int day = (UNSAFE.getByte(addr+off+8) - '0') * 10 + (UNSAFE.getByte(addr+off+9) - '0');
-        int hour = (UNSAFE.getByte(addr+off+11) - '0') * 10 + (UNSAFE.getByte(addr+off+12) - '0');
-        int minute = (UNSAFE.getByte(addr+off+14) - '0') * 10 + (UNSAFE.getByte(addr+off+15) - '0');
-        int second = (UNSAFE.getByte(addr+off+17) - '0') * 10 + (UNSAFE.getByte(addr+off+18) - '0');
-        long totalDays = 365L * (year - 1970);
-        totalDays += countLeapYears(year - 1) - countLeapYears(1969);
-        boolean leap = (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
-        totalDays += (leap ? DAYS_CUM_LEAP : DAYS_CUM)[month - 1] + day - 1;
-        return ((totalDays * 24 + hour) * 60 + minute) * 60000L + second * 1000L;
-    }
-
-    private static double parseDoubleUnsafe(long addr, int start, int end) {
-        boolean neg = false;
-        int i = start;
-        if (i < end && UNSAFE.getByte(addr + i) == '-') { neg = true; i++; }
-        long intPart = 0;
-        while (i < end && UNSAFE.getByte(addr + i) != '.') { intPart = intPart * 10 + (UNSAFE.getByte(addr + i) - '0'); i++; }
-        double result = intPart;
-        if (i < end && UNSAFE.getByte(addr + i) == '.') {
-            i++;
-            long frac = 0; double div = 1;
-            while (i < end) { frac = frac * 10 + (UNSAFE.getByte(addr + i) - '0'); div *= 10; i++; }
-            result += frac / div;
-        }
-        return neg ? -result : result;
     }
 
     private static int appendDoubleBytes(byte[] buf, int pos, double d) {

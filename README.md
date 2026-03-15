@@ -1,6 +1,6 @@
-# Streaming Aggregation: 57K to 9.1M events/sec
+# Streaming Aggregation: 57K to 9.3M events/sec
 
-A Java streaming window aggregation engine, optimized from **57,823 ev/s to 9,154,010 ev/s** (158x improvement) in **108 autonomous experiments** using [autoresearch](https://github.com/sderosiaux/claude-plugins).
+A Java streaming window aggregation engine, optimized from **57,823 ev/s to 9,345,794 ev/s** (162x improvement) in **110+ autonomous experiments** using [autoresearch](https://github.com/sderosiaux/claude-plugins).
 
 Every commit in this repo is an experiment. The commit messages document the technique, the measured throughput, and the delta from the previous best.
 
@@ -11,7 +11,7 @@ Process 10M timestamped CSV sensor events through:
 - **Sliding windows** (5 min window, 1 min slide): p50, p99 per sensor
 - 1,000 sensors, 24 hours of data, 5% late events
 
-Single file, Java 21, no external dependencies.
+Single file, Java 21+, no external dependencies.
 
 ## Run it
 
@@ -42,28 +42,36 @@ Read the commit history bottom-up (`git log --oneline --reverse`) to follow the 
 7,668,711 → mmap file reading
 8,536,103 → inline sliding percentiles (eliminate intermediate allocation)
 9,154,010 → direct mmap parsing via sun.misc.Unsafe
+9,216,589 → single file-wide mmap shared across all threads
+9,345,794 → MappedByteBuffer zero-copy parsing (no Unsafe)
 ```
 
 ## Key techniques
 
 | Category | Technique | Impact |
 |----------|-----------|--------|
-| **I/O** | mmap + Unsafe direct memory access (no heap copy) | +12% |
-| **Parsing** | Manual ISO-8601 parser, precomputed day offset | +8% |
+| **I/O** | mmap + MappedByteBuffer.get(int) zero-copy direct parsing | +12% |
+| **Parsing** | Manual ISO-8601 parser, precomputed day offset, hardcoded sensor format | +8% |
 | **Data structures** | Array-indexed [minute][sensor] layout, no HashMap | +6x |
 | **Parallelism** | 12-thread chunk parse, sensor-range merge, minute-range emit | +3x |
 | **Percentiles** | Quickselect with median-of-3 pivot, inline during emit | +12% |
 | **Output** | Direct byte[] assembly, zero-copy buffers | +17% |
 | **Memory** | Unified TumblingState fits one 64-byte cache line | +4% |
+| **Emit** | Range-bounded iteration [gMin..gMax], direct merge (no temp array) | +2% |
 
 ## What didn't work
 
-~85 experiments were discarded. Patterns that consistently lost:
+~90 experiments were discarded. Patterns that consistently lost:
 - **Minute-range merge parallelism** (-10%): cache thrashing on shared mergedTumbling array
 - **Fused sliding+tumbling emit** (-13%): working set too large for L1/L2 cache
 - **Arrays.sort replacing quickselect** (-5%): full sort is O(n log n), quickselect with partial partition reuse is O(n)
 - **Adding fields to TumblingState** (-5%): pushed object past 64-byte cache line boundary
 - **Smaller initial values array** (-8%): resize copies offset allocation savings
+- **MemorySegment API** (bimodal): JIT inconsistently eliminates bounds checks, 6.2M-10.2M range
+- **Byte[] copy from mmap** (-10%): 384MB heap allocation + copyMemory0 + GC overhead
+- **pread-based parallel reading** (-12%): per-chunk syscalls slower than single mmap
+- **ParallelGC** (-15%): more stop-the-world pauses than G1GC for this workload
+- **Insertion sort for percentiles** (-3%): conditional branches hurt branch prediction vs quickselect
 
 ## Architecture
 
@@ -71,23 +79,23 @@ Read the commit history bottom-up (`git log --oneline --reverse`) to follow the 
 ┌──────────────────────────────────────────────────────────┐
 │  mmap file (388MB) → 12 chunks (~32MB each)              │
 └────────┬─────────────────────────────────────────────────┘
-         │ 12 threads, Unsafe direct memory access
+         │ 12 threads, MappedByteBuffer.get(int) direct access
          ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Parse: manual ISO timestamp, branchless comma scan,     │
+│  Parse: manual ISO timestamp, hardcoded sensor_XXXX,     │
 │         inline double parser → TumblingState[min][sensor] │
 └────────┬─────────────────────────────────────────────────┘
          │ 12 threads, sensor-range parallelism
          ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Merge: per-sensor temp array (12KB, fits L1 cache)      │
+│  Merge: direct into shared mergedTumbling (no temp array) │
 └────────┬─────────────────────────────────────────────────┘
          │ 12 threads, minute-range parallelism
          ▼
 ┌──────────────────────────────────────────────────────────┐
 │  Emit: sliding (inline quickselect p50/p99)              │
 │        tumbling (count/sum/min/max/avg)                  │
-│        → direct byte[] buffers                           │
+│        → direct byte[] buffers, range-bounded            │
 └────────┬─────────────────────────────────────────────────┘
          │ sequential
          ▼
@@ -106,7 +114,7 @@ The `autoresearch.jsonl` file contains the full experiment log with metrics for 
 
 | File | Purpose |
 |------|---------|
-| `src/StreamingAggregator.java` | The optimized engine (500 lines) |
+| `src/StreamingAggregator.java` | The optimized engine (~430 lines) |
 | `src/DataGenerator.java` | Generates deterministic test data |
 | `src/BatchValidator.java` | Correctness oracle (naive but correct) |
 | `autoresearch.sh` | Benchmark harness |

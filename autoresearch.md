@@ -14,7 +14,7 @@ Maximize throughput (events/sec) of `StreamingAggregator.java`. 10M timestamped 
 
 ## Constraints
 - `./autoresearch.checks.sh` must pass
-- Java 21 stdlib only
+- Java stdlib only (no external deps). Any JVM implementation (Temurin, GraalVM, etc.) is allowed.
 
 ## How to Run
 `./autoresearch.sh` outputs `METRIC name=number` lines.
