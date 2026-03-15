@@ -17,47 +17,46 @@ Maximize throughput (events/sec) of `StreamingAggregator.java`. 10M timestamped 
 - Java 21 stdlib only
 
 ## Profiling Notes
-### Phase breakdown at 4.5M ev/s (current best, exp 35):
-- Parse (parallel chunk processing): 777ms (46%)
-- Merge+pct (parallel merge+percentile): 322ms (19%)
-- Emit (parallel StringBuilder format): 5ms (0.3%)
-- Output (stdout write, ~160MB): 584ms (35%)
+### Phase breakdown at 5M ev/s (current best, exp 49):
+- Parse (parallel chunk processing): ~777ms (46%)
+- Merge+pct (parallel merge+percentile): ~322ms (19%)
+- Emit+convert (parallel StringBuilder→byte[]): ~100ms (6%)
+- Output (stdout write, ~160MB): ~500ms (30%)
 
-### Key: parse and output dominate. Emit eliminated via sorted-order + parallel emit. Output is I/O-bound. Parse is the main CPU bottleneck.
+### Key: parse and output dominate. Both are near their theoretical limits for this architecture. Output is I/O-bound (pipe). Parse is bounded by per-event processing overhead (5 sliding window assignments per event).
 
-## What's Been Tried (35 experiments)
+## What's Been Tried (55 experiments, 18 kept)
 
 | # | Experiment | Metric | Result |
 |---|-----------|--------|--------|
 | 0 | Baseline | 57,823 | baseline |
-| 1-8 | Parsing/data structure optimizations | → 357,935 | series of keeps |
-| 9-11 | Emit strategy + direct sensor index | → 1,857,700 | KEEP (+420%) |
+| 1-11 | Parsing/data structure/emit opts | → 1,857,700 | series of keeps |
 | 13 | Multi-threaded parallel chunks + byte[] | 2,683,123 | KEEP (+44%) |
 | 19 | Parallel merge+emit by sensor range | 3,480,682 | KEEP (+30%) |
-| 24-29 | Various merge/sort/emit opts | — | all DISCARD |
-| 30 | Single-partition (no merge) | 2,155,172 | DISCARD (-38%) |
-| 31 | Pre-sorted sliding + merge-sort | 3,035,822 | DISCARD (-13%) |
-| 32 | Sorted-order emit (no Collections.sort) | 3,954,132 | KEEP (+13.6%) |
-| 33 | byte[] output buffer | 3,548,616 | DISCARD (-10%) |
+| 32 | Sorted-order emit (no sort) | 3,954,132 | KEEP (+13.6%) |
 | 34 | Parallel emit by minute range | 4,327,131 | KEEP (+9.4%) |
 | 35 | Optimized sliding window loop | 4,504,504 | KEEP (+4.1%) |
+| 39 | Parallel byte[] conversion in emit | 4,928,536 | KEEP (+9.4%) |
+| 49 | Bundled emit: prefixes + direct append | 5,010,020 | KEEP (+1.7%) |
 
 ## Tabu
-- Single-partition: sequential parsing too slow
-- Pre-sorted sliding states: sort overhead > quickselect savings
-- byte[] output buffer: Long.toString().getBytes() alloc overhead
-- Mmap byte-level: no gain over byte[] chunk
-- Independent file handles: OS page cache already parallel
-- Fixed-offset parsing: JIT already optimizes comma scan
-- Pre-allocate sensor rows: memory waste
-- parallelSort: overhead for small arrays
-- BufferedWriter output: slower than StringBuilder
+- Single-partition: sequential parsing too slow (-38%)
+- Pre-sorted sliding: sort overhead > quickselect savings (-13%)
+- byte[] output buffer: alloc overhead (-10%)
+- Fused merge+emit: poor cross-partition cache locality (-5%)
+- 8MB BufferedOutputStream: cache pressure (-5%)
+- Fewer chunks (nThreads/2): reduced parse parallelism
+- Fixed-offset comma: JIT already optimizes
+- Cached date computation: JIT already optimizes
+- Skip-ahead newline scan: JIT already optimizes
+- FileChannel output: no gain over BufferedOutputStream
+- Pre-computed timestamp prefixes alone: within noise
+- Direct append (no sb2) alone: within noise
+- Bounded minute range: only ~60 empty slots, negligible
 
 ## Landscape Model
-Current: 4.5M ev/s (78x baseline). Architecture: parallel parse → parallel merge+pct → parallel emit → sequential output.
+Current: 5.01M ev/s (87x baseline). Architecture: parallel parse → parallel merge+pct → parallel emit+byte[]convert → sequential output.
 
-**Gradient**: Parse=46%, Output=35%, Merge+pct=19%. Parse optimization or output pipelining are the highest-leverage areas.
+**Exhausted dimensions**: parsing micro-opts (JIT handles), emit strategy, sort elimination, merge parallelism, output method, buffer sizes, chunk count.
 
-**Promising unexplored**: MappedByteBuffer for parse (avoid copy), overlap parse with merge, reduce SlidingState.add allocations, FileChannel output instead of stdout pipe, reduce comma scanning overhead.
-
-**Exhausted**: emit strategy, sort elimination, sliding loop structure, merge parallelism.
+**Remaining opportunity**: SWAR/Unsafe byte processing, MemorySegment API, overlapping parse with output via pipelining, reducing SlidingState memory pressure, data structure transposition [sensor][minute] → [minute][sensor].
