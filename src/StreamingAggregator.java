@@ -167,10 +167,13 @@ public class StreamingAggregator {
         final long bMs = baseMs;
         int sensorsPerThread = (sc + nThreads - 1) / nThreads;
 
-        // Shared merged arrays
-        TumblingState[][] mergedTumbling = new TumblingState[sc][];
-        // Store pre-computed percentiles: [sensor][minute] -> {p50, p99}
-        double[][][] slidingPcts = new double[sc][][];
+        // Shared merged arrays — [minute][sensor] layout for cache-friendly emit
+        TumblingState[][] mergedTumbling = new TumblingState[MAX_MINUTES][];
+        double[][][] slidingPcts = new double[MAX_MINUTES][][];
+        for (int m = 0; m < MAX_MINUTES; m++) {
+            mergedTumbling[m] = new TumblingState[sc];
+            slidingPcts[m] = new double[sc][];
+        }
 
         @SuppressWarnings("unchecked")
         Future<?>[] mergeFutures = new Future[nThreads];
@@ -211,9 +214,10 @@ public class StreamingAggregator {
                 int pos = 0;
                 for (int m = mStart; m < mEnd; m++) {
                     byte[] pfx = slidingPfx[m];
+                    double[][] row = slidingPcts[m];
                     for (int s = 0; s < fsc; s++) {
-                        if (slidingPcts[s] == null || slidingPcts[s][m] == null) continue;
-                        double[] pcts = slidingPcts[s][m];
+                        double[] pcts = row[s];
+                        if (pcts == null) continue;
                         if (pos + 200 > buf.length) buf = Arrays.copyOf(buf, buf.length * 2);
                         System.arraycopy(pfx, 0, buf, pos, pfx.length); pos += pfx.length;
                         System.arraycopy(sNameBytes[s], 0, buf, pos, sNameBytes[s].length); pos += sNameBytes[s].length;
@@ -240,9 +244,10 @@ public class StreamingAggregator {
                 int pos = 0;
                 for (int m = mStart; m < mEnd; m++) {
                     byte[] pfx = tumblingPfx[m];
+                    TumblingState[] tRow = mergedTumbling[m];
                     for (int s = 0; s < fsc; s++) {
-                        if (mergedTumbling[s] == null || mergedTumbling[s][m] == null) continue;
-                        TumblingState state = mergedTumbling[s][m];
+                        TumblingState state = tRow[s];
+                        if (state == null) continue;
                         if (pos + 200 > buf.length) buf = Arrays.copyOf(buf, buf.length * 2);
                         System.arraycopy(pfx, 0, buf, pos, pfx.length); pos += pfx.length;
                         System.arraycopy(sNameBytes[s], 0, buf, pos, sNameBytes[s].length); pos += sNameBytes[s].length;
@@ -311,10 +316,14 @@ public class StreamingAggregator {
                     }
                 }
             }
-            mergedTumbling[s] = hasTumbling ? merged : null;
+            // Write merged tumbling to [minute][sensor] layout
+            if (hasTumbling) {
+                for (int m = globalMin; m <= globalMax; m++) {
+                    if (merged[m] != null) mergedTumbling[m][s] = merged[m];
+                }
+            }
             if (hasRaw) {
                 // Compute sliding window percentiles by combining 5 consecutive minutes
-                double[][] pcts = new double[MAX_MINUTES][];
                 for (int m = Math.max(0, globalMin - 4); m <= Math.min(globalMax, MAX_MINUTES - 1); m++) {
                     int totalSize = 0;
                     int kEnd = Math.min(m + 4, MAX_MINUTES - 1);
@@ -335,9 +344,8 @@ public class StreamingAggregator {
                     int i50 = Math.max(0, (int) Math.ceil(50.0 / 100.0 * totalSize) - 1);
                     double p99 = SlidingState.quickselect(combined, 0, totalSize - 1, i99);
                     double p50 = SlidingState.quickselect(combined, 0, i99, i50);
-                    pcts[m] = new double[]{p50, p99};
+                    slidingPcts[m][s] = new double[]{p50, p99};
                 }
-                slidingPcts[s] = pcts;
             }
         }
     }
