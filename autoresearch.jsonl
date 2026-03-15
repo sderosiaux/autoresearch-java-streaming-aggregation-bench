@@ -85,3 +85,4 @@
 {"commit":"8882905","metric":5906674,"status":"discard","description":"experiment: bypass System.out with FileDescriptor.out — pipe buffer contention (5906674 ev/s, -8.4%)","metrics":{},"timestamp":1773584172}
 {"commit":"8882905","metric":5546311,"status":"discard","description":"experiment: concat emit chunks before writing — 166MB extra allocation GC pressure (5546311 ev/s, -14.0%)","metrics":{},"timestamp":1773584216}
 {"commit":"4b2ec2c","metric":6720430,"status":"keep","description":"experiment: merge SlidingState into TumblingState — unified state eliminates redundant array dereferences (6720430 ev/s, +4.2%)","metrics":{},"timestamp":1773585192}
+{"commit":"2056fbd","metric":7283321,"status":"keep","description":"experiment: integer percentile indices + zero-copy emit buffers — eliminate Math.ceil and 168MB trim copies (7283321 ev/s, +8.4%)","metrics":{},"timestamp":1773585441}

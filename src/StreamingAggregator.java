@@ -340,12 +340,11 @@ public class StreamingAggregator {
         long size = end - start;
         if (size <= 0) return ps;
 
-        // Read chunk into byte array
-        ByteBuffer bbuf = ByteBuffer.allocate((int) Math.min(size, Integer.MAX_VALUE));
-        channel.read(bbuf, start);
-        bbuf.flip();
-        byte[] data = bbuf.array();
-        int limit = bbuf.limit();
+        // Read chunk via mmap — benefits from kernel readahead
+        java.nio.MappedByteBuffer mbb = channel.map(FileChannel.MapMode.READ_ONLY, start, Math.min(size, Integer.MAX_VALUE));
+        byte[] data = new byte[(int) Math.min(size, Integer.MAX_VALUE)];
+        mbb.get(data);
+        int limit = data.length;
 
         int pos = 0;
         while (pos < limit) {
