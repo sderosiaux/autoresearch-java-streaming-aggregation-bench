@@ -182,13 +182,8 @@ public class StreamingAggregator {
                 lineCount++;
                 maxEventTime = Math.max(maxEventTime, timestampMs);
 
-                if (lineCount % 100_000 == 0) {
-                    long newWatermark = maxEventTime - WATERMARK_SLACK_MS;
-                    if (newWatermark > watermarkMs) {
-                        watermarkMs = newWatermark;
-                        emitReadyWindows();
-                    }
-                }
+                // Defer all emission to end — single pass over windows
+                // Late data still gets accumulated correctly
 
                 long tumblingStart = timestampMs - (timestampMs % TUMBLING_WINDOW_MS);
                 int tMinute = minuteIdx(tumblingStart);
