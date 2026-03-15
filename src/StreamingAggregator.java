@@ -145,7 +145,6 @@ public class StreamingAggregator {
 
         // Collect partition states
         PartitionState[] parts = new PartitionState[nThreads];
-        String[] sensorNames = new String[MAX_SENSORS];
         int sensorCount = 0;
         int globalMinMinute = MAX_MINUTES;
         int globalMaxMinute = -1;
@@ -154,11 +153,16 @@ public class StreamingAggregator {
             if (parts[t].sensorCount > sensorCount) sensorCount = parts[t].sensorCount;
             if (parts[t].minMinute < globalMinMinute) globalMinMinute = parts[t].minMinute;
             if (parts[t].maxMinute > globalMaxMinute) globalMaxMinute = parts[t].maxMinute;
-            for (int s = 0; s < parts[t].sensorCount; s++) {
-                if (parts[t].sensorNames[s] != null && sensorNames[s] == null) {
-                    sensorNames[s] = parts[t].sensorNames[s];
-                }
-            }
+        }
+        // Generate sensor names from indices (fixed format sensor_XXXX)
+        String[] sensorNames = new String[sensorCount];
+        char[] nameBuf = "sensor_0000".toCharArray();
+        for (int s = 0; s < sensorCount; s++) {
+            nameBuf[7] = (char)('0' + s / 1000);
+            nameBuf[8] = (char)('0' + (s / 100) % 10);
+            nameBuf[9] = (char)('0' + (s / 10) % 10);
+            nameBuf[10] = (char)('0' + s % 10);
+            sensorNames[s] = new String(nameBuf);
         }
         // Parallel merge+percentile by sensor range
         final int sc = sensorCount;
@@ -367,7 +371,6 @@ public class StreamingAggregator {
         int baseMinute = (int)(baseMs / 60_000);
         int dayOffset = baseDayMinutes - baseMinute;
 
-        byte[] sensorBuf = new byte[11]; // "sensor_XXXX"
         byte[] lineBuf = new byte[48]; // max line: 41 bytes + 7 margin
 
         int pos = chunkStart;
@@ -383,10 +386,7 @@ public class StreamingAggregator {
             int sIdx = (lineBuf[28] - '0') * 1000 + (lineBuf[29] - '0') * 100
                      + (lineBuf[30] - '0') * 10 + (lineBuf[31] - '0');
 
-            if (ps.sensorNames[sIdx] == null) {
-                ps.sensorNames[sIdx] = new String(lineBuf, 21, 11);
-                if (sIdx >= ps.sensorCount) ps.sensorCount = sIdx + 1;
-            }
+            if (sIdx >= ps.sensorCount) ps.sensorCount = sIdx + 1;
 
             // Specialized parser: scaled int only (no FP in hot path)
             // Offsets relative to lineBuf: value starts at 33
