@@ -357,17 +357,13 @@ public class StreamingAggregator {
             int lineEnd = pos;
             pos++; // skip newline
 
-            if (lineEnd - lineStart < 20) continue;
+            if (lineEnd - lineStart < 22) continue;
 
-            // Find commas
-            int c1 = -1, c2 = -1;
-            for (int i = lineStart; i < lineEnd; i++) {
-                if (data[i] == ',') {
-                    if (c1 < 0) c1 = i;
-                    else { c2 = i; break; }
-                }
-            }
-            if (c2 < 0) continue;
+            // Fixed CSV format: YYYY-MM-DDTHH:MM:SSZ,sensor_XXXX,value
+            int c1 = lineStart + 20;
+            // Second comma: sensor name is "sensor_" + 1-4 digits
+            int c2 = c1 + 8; // minimum: sensor_X
+            while (c2 < lineEnd && data[c2] != ',') c2++;
 
             // Parse timestamp
             long timestampMs = parseIsoBytesArr(data, lineStart);
