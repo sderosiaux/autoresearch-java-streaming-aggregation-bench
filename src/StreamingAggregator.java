@@ -159,7 +159,6 @@ public class StreamingAggregator {
                 }
             }
         }
-
         // Parallel merge+percentile by sensor range
         final int sc = sensorCount;
         final String[] sNames = sensorNames;
@@ -182,45 +181,81 @@ public class StreamingAggregator {
         }
         for (Future<?> f : mergeFutures) f.get();
 
+        // Parallel emit: split minutes across threads, each builds its own StringBuilder
+        // Output order: all sliding by (minute, sensor), then all tumbling by (minute, sensor)
+        int minutesPerThread = (MAX_MINUTES + nThreads - 1) / nThreads;
+
+        // Emit sliding windows in parallel
+        @SuppressWarnings("unchecked")
+        Future<StringBuilder>[] slidingEmitFutures = new Future[nThreads];
+        for (int t = 0; t < nThreads; t++) {
+            int mStart = t * minutesPerThread;
+            int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
+            final int fsc = sc;
+            slidingEmitFutures[t] = pool.submit(() -> {
+                StringBuilder out = new StringBuilder(500_000 * 80 / nThreads);
+                StringBuilder sb2 = new StringBuilder(128);
+                for (int m = mStart; m < mEnd; m++) {
+                    long windowStart = bMs + (long) m * 60_000;
+                    for (int s = 0; s < fsc; s++) {
+                        if (slidingPcts[s] == null || slidingPcts[s][m] == null) continue;
+                        double[] pcts = slidingPcts[s][m];
+                        sb2.setLength(0);
+                        sb2.append("sliding,").append(windowStart).append(',')
+                          .append(sNames[s]).append(',');
+                        appendDouble(sb2, pcts[0]); sb2.append(',');
+                        appendDouble(sb2, pcts[1]); sb2.append(",new\n");
+                        out.append(sb2);
+                    }
+                }
+                return out;
+            });
+        }
+
+        // Emit tumbling windows in parallel
+        @SuppressWarnings("unchecked")
+        Future<StringBuilder>[] tumblingEmitFutures = new Future[nThreads];
+        for (int t = 0; t < nThreads; t++) {
+            int mStart = t * minutesPerThread;
+            int mEnd = Math.min(mStart + minutesPerThread, MAX_MINUTES);
+            final int fsc = sc;
+            tumblingEmitFutures[t] = pool.submit(() -> {
+                StringBuilder out = new StringBuilder(500_000 * 80 / nThreads);
+                StringBuilder sb2 = new StringBuilder(128);
+                for (int m = mStart; m < mEnd; m++) {
+                    long windowStart = bMs + (long) m * 60_000;
+                    for (int s = 0; s < fsc; s++) {
+                        if (mergedTumbling[s] == null || mergedTumbling[s][m] == null) continue;
+                        TumblingState state = mergedTumbling[s][m];
+                        sb2.setLength(0);
+                        sb2.append("tumbling,").append(windowStart).append(',')
+                          .append(sNames[s]).append(',').append(state.count).append(',');
+                        appendDouble(sb2, state.sum); sb2.append(',');
+                        appendDouble(sb2, state.min); sb2.append(',');
+                        appendDouble(sb2, state.max); sb2.append(',');
+                        appendDouble(sb2, state.avg()); sb2.append(",new\n");
+                        out.append(sb2);
+                    }
+                }
+                return out;
+            });
+        }
+
+        // Output in order: sliding chunks first, then tumbling chunks
+        BufferedOutputStream bos = new BufferedOutputStream(System.out, 1 << 20);
+        for (Future<StringBuilder> f : slidingEmitFutures) {
+            String s = f.get().toString();
+            bos.write(s.getBytes());
+        }
+        for (Future<StringBuilder> f : tumblingEmitFutures) {
+            String s = f.get().toString();
+            bos.write(s.getBytes());
+        }
+        bos.flush();
+
         pool.shutdown();
         channel.close();
         raf.close();
-
-        // Emit in sorted order: sliding first (lex < tumbling), then minute, then sensor
-        StringBuilder out = new StringBuilder(3_000_000 * 80);
-        StringBuilder sb = new StringBuilder(128);
-
-        // Sliding windows first
-        for (int m = 0; m < MAX_MINUTES; m++) {
-            long windowStart = bMs + (long) m * 60_000;
-            for (int s = 0; s < sc; s++) {
-                if (slidingPcts[s] == null || slidingPcts[s][m] == null) continue;
-                double[] pcts = slidingPcts[s][m];
-                sb.setLength(0);
-                sb.append("sliding,").append(windowStart).append(',')
-                  .append(sNames[s]).append(',');
-                appendDouble(sb, pcts[0]); sb.append(',');
-                appendDouble(sb, pcts[1]); sb.append(",new\n");
-                out.append(sb);
-            }
-        }
-        // Tumbling windows second
-        for (int m = 0; m < MAX_MINUTES; m++) {
-            long windowStart = bMs + (long) m * 60_000;
-            for (int s = 0; s < sc; s++) {
-                if (mergedTumbling[s] == null || mergedTumbling[s][m] == null) continue;
-                TumblingState state = mergedTumbling[s][m];
-                sb.setLength(0);
-                sb.append("tumbling,").append(windowStart).append(',')
-                  .append(sNames[s]).append(',').append(state.count).append(',');
-                appendDouble(sb, state.sum); sb.append(',');
-                appendDouble(sb, state.min); sb.append(',');
-                appendDouble(sb, state.max); sb.append(',');
-                appendDouble(sb, state.avg()); sb.append(",new\n");
-                out.append(sb);
-            }
-        }
-        System.out.print(out);
     }
 
     static void mergeAndComputePcts(PartitionState[] parts, int sStart, int sEnd,
