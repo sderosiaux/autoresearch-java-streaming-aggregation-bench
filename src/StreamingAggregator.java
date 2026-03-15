@@ -146,97 +146,43 @@ public class StreamingAggregator {
             futures[t] = pool.submit(() -> processChunk(channel, start, end, bMs));
         }
 
-        // Merge results
-        TumblingState[][] mergedTumbling = new TumblingState[MAX_SENSORS][];
-        SlidingState[][] mergedSliding = new SlidingState[MAX_SENSORS][];
+        // Collect partition states
+        PartitionState[] parts = new PartitionState[nThreads];
         String[] sensorNames = new String[MAX_SENSORS];
         int sensorCount = 0;
-
-        for (Future<PartitionState> f : futures) {
-            PartitionState ps = f.get();
-            if (ps.sensorCount > sensorCount) sensorCount = ps.sensorCount;
-
-            for (int s = 0; s < ps.sensorCount; s++) {
-                if (ps.sensorNames[s] != null && sensorNames[s] == null) {
-                    sensorNames[s] = ps.sensorNames[s];
-                }
-
-                if (ps.tumbling[s] != null) {
-                    if (mergedTumbling[s] == null) {
-                        mergedTumbling[s] = ps.tumbling[s];
-                    } else {
-                        for (int m = 0; m < MAX_MINUTES; m++) {
-                            if (ps.tumbling[s][m] != null) {
-                                if (mergedTumbling[s][m] == null) {
-                                    mergedTumbling[s][m] = ps.tumbling[s][m];
-                                } else {
-                                    mergedTumbling[s][m].merge(ps.tumbling[s][m]);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (ps.sliding[s] != null) {
-                    if (mergedSliding[s] == null) {
-                        mergedSliding[s] = ps.sliding[s];
-                    } else {
-                        for (int m = 0; m < MAX_MINUTES; m++) {
-                            if (ps.sliding[s][m] != null) {
-                                if (mergedSliding[s][m] == null) {
-                                    mergedSliding[s][m] = ps.sliding[s][m];
-                                } else {
-                                    mergedSliding[s][m].merge(ps.sliding[s][m]);
-                                }
-                            }
-                        }
-                    }
+        for (int t = 0; t < nThreads; t++) {
+            parts[t] = futures[t].get();
+            if (parts[t].sensorCount > sensorCount) sensorCount = parts[t].sensorCount;
+            for (int s = 0; s < parts[t].sensorCount; s++) {
+                if (parts[t].sensorNames[s] != null && sensorNames[s] == null) {
+                    sensorNames[s] = parts[t].sensorNames[s];
                 }
             }
+        }
+
+        // Parallel merge+emit by sensor range
+        final int sc = sensorCount;
+        final String[] sNames = sensorNames;
+        final long bMs = baseMs;
+        int sensorsPerThread = (sc + nThreads - 1) / nThreads;
+        @SuppressWarnings("unchecked")
+        Future<List<String>>[] emitFutures = new Future[nThreads];
+
+        for (int t = 0; t < nThreads; t++) {
+            int sStart = t * sensorsPerThread;
+            int sEnd = Math.min(sStart + sensorsPerThread, sc);
+            emitFutures[t] = pool.submit(() -> mergeAndEmit(parts, sStart, sEnd, sNames, bMs));
+        }
+
+        // Collect and sort all results
+        List<String> results = new ArrayList<>();
+        for (Future<List<String>> f : emitFutures) {
+            results.addAll(f.get());
         }
 
         pool.shutdown();
         channel.close();
         raf.close();
-
-        // Emit results
-        List<String> results = new ArrayList<>();
-        StringBuilder sb = new StringBuilder(128);
-
-        for (int s = 0; s < sensorCount; s++) {
-            if (mergedTumbling[s] == null) continue;
-            String sensor = sensorNames[s];
-            for (int m = 0; m < MAX_MINUTES; m++) {
-                TumblingState state = mergedTumbling[s][m];
-                if (state == null) continue;
-                long windowStart = baseMs + (long) m * 60_000;
-                sb.setLength(0);
-                sb.append("tumbling,").append(windowStart).append(',')
-                  .append(sensor).append(',').append(state.count).append(',');
-                appendDouble(sb, state.sum); sb.append(',');
-                appendDouble(sb, state.min); sb.append(',');
-                appendDouble(sb, state.max); sb.append(',');
-                appendDouble(sb, state.avg()); sb.append(",new");
-                results.add(sb.toString());
-            }
-        }
-
-        for (int s = 0; s < sensorCount; s++) {
-            if (mergedSliding[s] == null) continue;
-            String sensor = sensorNames[s];
-            for (int m = 0; m < MAX_MINUTES; m++) {
-                SlidingState state = mergedSliding[s][m];
-                if (state == null) continue;
-                long windowStart = baseMs + (long) m * 60_000;
-                double[] pcts = state.percentiles();
-                sb.setLength(0);
-                sb.append("sliding,").append(windowStart).append(',')
-                  .append(sensor).append(',');
-                appendDouble(sb, pcts[0]); sb.append(',');
-                appendDouble(sb, pcts[1]); sb.append(",new");
-                results.add(sb.toString());
-            }
-        }
 
         Collections.sort(results);
         StringBuilder out = new StringBuilder(results.size() * 80);
@@ -244,6 +190,81 @@ public class StreamingAggregator {
             out.append(r).append('\n');
         }
         System.out.print(out);
+    }
+
+    static List<String> mergeAndEmit(PartitionState[] parts, int sStart, int sEnd,
+                                      String[] sensorNames, long baseMs) {
+        List<String> results = new ArrayList<>();
+        StringBuilder sb = new StringBuilder(128);
+
+        for (int s = sStart; s < sEnd; s++) {
+            String sensor = sensorNames[s];
+            if (sensor == null) continue;
+
+            // Merge tumbling for this sensor
+            TumblingState[] merged = null;
+            for (PartitionState ps : parts) {
+                if (ps.tumbling[s] != null) {
+                    if (merged == null) {
+                        merged = ps.tumbling[s];
+                    } else {
+                        for (int m = 0; m < MAX_MINUTES; m++) {
+                            if (ps.tumbling[s][m] != null) {
+                                if (merged[m] == null) merged[m] = ps.tumbling[s][m];
+                                else merged[m].merge(ps.tumbling[s][m]);
+                            }
+                        }
+                    }
+                }
+            }
+            if (merged != null) {
+                for (int m = 0; m < MAX_MINUTES; m++) {
+                    TumblingState state = merged[m];
+                    if (state == null) continue;
+                    long windowStart = baseMs + (long) m * 60_000;
+                    sb.setLength(0);
+                    sb.append("tumbling,").append(windowStart).append(',')
+                      .append(sensor).append(',').append(state.count).append(',');
+                    appendDouble(sb, state.sum); sb.append(',');
+                    appendDouble(sb, state.min); sb.append(',');
+                    appendDouble(sb, state.max); sb.append(',');
+                    appendDouble(sb, state.avg()); sb.append(",new");
+                    results.add(sb.toString());
+                }
+            }
+
+            // Merge sliding for this sensor
+            SlidingState[] sMerged = null;
+            for (PartitionState ps : parts) {
+                if (ps.sliding[s] != null) {
+                    if (sMerged == null) {
+                        sMerged = ps.sliding[s];
+                    } else {
+                        for (int m = 0; m < MAX_MINUTES; m++) {
+                            if (ps.sliding[s][m] != null) {
+                                if (sMerged[m] == null) sMerged[m] = ps.sliding[s][m];
+                                else sMerged[m].merge(ps.sliding[s][m]);
+                            }
+                        }
+                    }
+                }
+            }
+            if (sMerged != null) {
+                for (int m = 0; m < MAX_MINUTES; m++) {
+                    SlidingState state = sMerged[m];
+                    if (state == null) continue;
+                    long windowStart = baseMs + (long) m * 60_000;
+                    double[] pcts = state.percentiles();
+                    sb.setLength(0);
+                    sb.append("sliding,").append(windowStart).append(',')
+                      .append(sensor).append(',');
+                    appendDouble(sb, pcts[0]); sb.append(',');
+                    appendDouble(sb, pcts[1]); sb.append(",new");
+                    results.add(sb.toString());
+                }
+            }
+        }
+        return results;
     }
 
     static PartitionState processChunk(FileChannel channel, long start, long end, long baseMs) throws IOException {

@@ -12,3 +12,9 @@
 {"commit":"4bc702a","metric":1422879,"status":"keep","description":"emit only at end, no intermediate emissions","metrics":{},"timestamp":1773549221}
 {"commit":"27d48e1","metric":1857700,"status":"keep","description":"direct sensor index from digits, eliminates HashMap lookup","metrics":{},"timestamp":1773549270}
 {"commit":"27d48e1","metric":1851508,"status":"discard","description":"memory-mapped I/O with byte-level parsing (no improvement vs BufferedReader)","metrics":{},"timestamp":1773549337}
+{"commit":"78db04d","metric":2683123,"status":"keep","description":"multi-threaded parallel chunk processing with byte[] parsing","metrics":{},"timestamp":1773549411}
+{"commit":"78db04d","metric":2670940,"status":"discard","description":"independent file handles per thread (no improvement)","metrics":{},"timestamp":1773549464}
+{"commit":"78db04d","metric":2598752,"status":"discard","description":"simplified sliding window loop (no improvement)","metrics":{},"timestamp":1773549509}
+{"commit":"78db04d","metric":2588661,"status":"discard","description":"pre-allocate sensor rows + hoist sRow (no improvement, memory waste)","metrics":{},"timestamp":1773549594}
+{"commit":"78db04d","metric":2590673,"status":"discard","description":"fixed-offset parsing (JIT already optimizes comma scan)","metrics":{},"timestamp":1773549643}
+{"commit":"78db04d","metric":2551671,"status":"discard","description":"smaller initial SlidingState array (more resizes, no gain)","metrics":{},"timestamp":1773549687}
