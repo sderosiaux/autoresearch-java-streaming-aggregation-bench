@@ -52,3 +52,6 @@
 {"commit":"4eabac9","metric":4918839,"status":"discard","description":"pre-computed timestamp prefixes: within noise (5-run confirmation)","metrics":{},"timestamp":1773553721}
 {"commit":"4eabac9","metric":4789272,"status":"discard","description":"nThreads/2 chunks: no improvement, reduced parse parallelism","metrics":{},"timestamp":1773553789}
 {"commit":"4eabac9","metric":5010020,"status":"keep","description":"bundled emit: pre-computed prefixes + direct append, no sb2 (5010020 ev/s, +1.7%)","metrics":{},"timestamp":1773553858}
+{"commit":"acef103","metric":4812319,"status":"discard","description":"bounded minute range: negligible savings (~60 empty slots)","metrics":{},"timestamp":1773553984}
+{"commit":"acef103","metric":4750593,"status":"discard","description":"fused merge+emit: 5% worse, poor cross-partition cache locality","metrics":{},"timestamp":1773554094}
+{"commit":"dcd3aac","metric":5157297,"status":"keep","description":"data layout transposition [sensor][minute] → [minute][sensor] for cache-friendly parse","metrics":{},"timestamp":1773554354}

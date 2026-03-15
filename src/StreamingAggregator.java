@@ -91,10 +91,10 @@ public class StreamingAggregator {
         }
     }
 
-    // Per-thread partition state
+    // Per-thread partition state — [minute][sensor] layout for cache-friendly access
     static class PartitionState {
-        TumblingState[][] tumbling = new TumblingState[MAX_SENSORS][];
-        SlidingState[][] sliding = new SlidingState[MAX_SENSORS][];
+        TumblingState[][] tumbling = new TumblingState[MAX_MINUTES][];
+        SlidingState[][] sliding = new SlidingState[MAX_MINUTES][];
         String[] sensorNames = new String[MAX_SENSORS];
         int sensorCount = 0;
         long baseMs;
@@ -258,41 +258,33 @@ public class StreamingAggregator {
     static void mergeAndComputePcts(PartitionState[] parts, int sStart, int sEnd,
                                      TumblingState[][] mergedTumbling, double[][][] slidingPcts) {
         for (int s = sStart; s < sEnd; s++) {
-            // Merge tumbling for this sensor
-            TumblingState[] merged = null;
+            // Merge tumbling for this sensor across partitions — partition layout is [minute][sensor]
+            TumblingState[] merged = new TumblingState[MAX_MINUTES];
+            boolean hasTumbling = false;
             for (PartitionState ps : parts) {
-                if (ps.tumbling[s] != null) {
-                    if (merged == null) {
-                        merged = ps.tumbling[s];
-                    } else {
-                        for (int m = 0; m < MAX_MINUTES; m++) {
-                            if (ps.tumbling[s][m] != null) {
-                                if (merged[m] == null) merged[m] = ps.tumbling[s][m];
-                                else merged[m].merge(ps.tumbling[s][m]);
-                            }
-                        }
-                    }
+                for (int m = 0; m < MAX_MINUTES; m++) {
+                    TumblingState[] row = ps.tumbling[m];
+                    if (row == null || row[s] == null) continue;
+                    hasTumbling = true;
+                    if (merged[m] == null) merged[m] = row[s];
+                    else merged[m].merge(row[s]);
                 }
             }
-            mergedTumbling[s] = merged;
+            mergedTumbling[s] = hasTumbling ? merged : null;
 
-            // Merge sliding for this sensor + compute percentiles
-            SlidingState[] sMerged = null;
+            // Merge sliding for this sensor + compute percentiles — partition layout is [minute][sensor]
+            SlidingState[] sMerged = new SlidingState[MAX_MINUTES];
+            boolean hasSliding = false;
             for (PartitionState ps : parts) {
-                if (ps.sliding[s] != null) {
-                    if (sMerged == null) {
-                        sMerged = ps.sliding[s];
-                    } else {
-                        for (int m = 0; m < MAX_MINUTES; m++) {
-                            if (ps.sliding[s][m] != null) {
-                                if (sMerged[m] == null) sMerged[m] = ps.sliding[s][m];
-                                else sMerged[m].merge(ps.sliding[s][m]);
-                            }
-                        }
-                    }
+                for (int m = 0; m < MAX_MINUTES; m++) {
+                    SlidingState[] sRow = ps.sliding[m];
+                    if (sRow == null || sRow[s] == null) continue;
+                    hasSliding = true;
+                    if (sMerged[m] == null) sMerged[m] = sRow[s];
+                    else sMerged[m].merge(sRow[s]);
                 }
             }
-            if (sMerged != null) {
+            if (hasSliding) {
                 double[][] pcts = new double[MAX_MINUTES][];
                 for (int m = 0; m < MAX_MINUTES; m++) {
                     if (sMerged[m] != null) {
@@ -358,23 +350,23 @@ public class StreamingAggregator {
             // Compute minute index relative to baseMs
             int eventMinute = (int) ((timestampMs - baseMs) / 60_000);
 
-            // Tumbling window — same minute since TUMBLING_WINDOW = 60s = 1 minute
+            // Tumbling window [minute][sensor] layout
             if (eventMinute >= 0 && eventMinute < MAX_MINUTES) {
-                TumblingState[] row = ps.tumbling[sIdx];
-                if (row == null) { row = new TumblingState[MAX_MINUTES]; ps.tumbling[sIdx] = row; }
-                TumblingState ts = row[eventMinute];
-                if (ts == null) { ts = new TumblingState(); row[eventMinute] = ts; }
+                TumblingState[] row = ps.tumbling[eventMinute];
+                if (row == null) { row = new TumblingState[MAX_SENSORS]; ps.tumbling[eventMinute] = row; }
+                TumblingState ts = row[sIdx];
+                if (ts == null) { ts = new TumblingState(); row[sIdx] = ts; }
                 ts.add(value);
             }
 
-            // Sliding windows — event belongs to 5 windows (minutes eventMinute-4 to eventMinute)
-            SlidingState[] sRow = ps.sliding[sIdx];
-            if (sRow == null) { sRow = new SlidingState[MAX_MINUTES]; ps.sliding[sIdx] = sRow; }
+            // Sliding windows [minute][sensor] layout
             int mStart = Math.max(0, eventMinute - 4);
             int mEnd = Math.min(eventMinute, MAX_MINUTES - 1);
             for (int m = mStart; m <= mEnd; m++) {
-                SlidingState ss = sRow[m];
-                if (ss == null) { ss = new SlidingState(); sRow[m] = ss; }
+                SlidingState[] sRow = ps.sliding[m];
+                if (sRow == null) { sRow = new SlidingState[MAX_SENSORS]; ps.sliding[m] = sRow; }
+                SlidingState ss = sRow[sIdx];
+                if (ss == null) { ss = new SlidingState(); sRow[sIdx] = ss; }
                 ss.add(value);
             }
         }
