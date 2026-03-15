@@ -361,9 +361,12 @@ public class StreamingAggregator {
 
             // Fixed CSV format: YYYY-MM-DDTHH:MM:SSZ,sensor_XXXX,value
             int c1 = lineStart + 20;
-            // Second comma: sensor name is "sensor_" + 1-4 digits
-            int c2 = c1 + 8; // minimum: sensor_X
-            while (c2 < lineEnd && data[c2] != ',') c2++;
+            // Second comma: sensor name is "sensor_" + 1-4 digits → c2 in [c1+9, c1+12]
+            int c2;
+            if (data[c1 + 9] == ',') c2 = c1 + 9;
+            else if (data[c1 + 10] == ',') c2 = c1 + 10;
+            else if (data[c1 + 11] == ',') c2 = c1 + 11;
+            else c2 = c1 + 12;
 
             // Parse timestamp
             long timestampMs = parseIsoBytesArr(data, lineStart);

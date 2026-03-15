@@ -65,3 +65,4 @@
 {"commit":"ba2c70e","metric":5617977,"status":"discard","description":"bypass BufferedOutputStream: regression, batching helps pipe writes","metrics":{},"timestamp":1773556023}
 {"commit":"ba2c70e","metric":5824111,"status":"keep","description":"experiment: merged bounds-check in processChunk — single if block for tumbling+sliding (5824111 ev/s, +1.4%)","metrics":{},"timestamp":1773581449}
 {"commit":"0f97e53","metric":5885815,"status":"keep","description":"experiment: hardcoded c1=lineStart+20, scan c2 from c1+8 — skip comma search loop (5885815 ev/s, +1.1%)","metrics":{},"timestamp":1773581650}
+{"commit":"0113597","metric":5966587,"status":"keep","description":"experiment: branchless c2 — chained if/else for sensor digit count, no scan loop (5966587 ev/s, +1.4%)","metrics":{},"timestamp":1773581683}
