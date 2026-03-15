@@ -1,1 +1,2 @@
 {"type":"config","name":"streaming-throughput","metricName":"throughput","metricUnit":"events/sec","bestDirection":"higher","maxExperiments":100}
+{"commit":"2ba3ded","metric":57823,"status":"keep","description":"baseline: naive single-threaded, Instant.parse, String.split, ArrayList percentiles","metrics":{},"timestamp":1773548163}
